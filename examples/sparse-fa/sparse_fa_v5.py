@@ -541,8 +541,8 @@ def high_perf_mtgr_sparse_attn_kernel(
                             T.tile.exp(r_factors[i, :, :], r_factors[i, :, :])
                             T.tile.mul(sumexp, sumexp, r_factors[i, :, :])
                             T.tile.add(sumexp, sumexp, sumexp_is[i, :, :])
-                            T.tile.broadcast(buf_2d, r_factors[i, :, :])
-                            T.tile.mul(acc_o, acc_o, buf_2d)
+                            T.tile.broadcast(bcast_buf, r_factors[i, :, :])
+                            T.tile.mul(acc_o, acc_o, bcast_buf)
 
                             T.wait_flag("V", "MTE2", SIG_IO_UB)
                             if i % cross_interval == 0:
@@ -696,7 +696,12 @@ def high_perf_sparse_attn_wrapper(
         cross_interval=cross_interval
     )
 
-    print(func.get_kernel_source()) # 可以解除注释打印算子源码验证
+    # print(func.get_kernel_source()) # 可以解除注释打印算子源码验证
+    print(q_seq_starts_i32)
+    print(split_points_i32)
+    print(tiles_prefix_sum_i32)
+    print(segment_offsets_padded_i32)
+    print(segment_rules_padded_i32)
 
     func(
         query,
@@ -981,7 +986,7 @@ if __name__ == "__main__":
         },
         {
             "H": 8,
-            "D": 128,
+            "D": 64,
             "seg_lengths": [
                 [2200, 200, 1024],
                 [1700, 300, 1100],
