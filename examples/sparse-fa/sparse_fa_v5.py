@@ -1,4 +1,4 @@
-# msprof op --kernel-name="main_kernel" python examples/sparse-fa/sparse_fa_v5.py
+# msprof op --kernel-name="main_kernel" --output="./log" python examples/sparse-fa/sparse_fa_v5.py
 
 import math
 import torch
@@ -216,13 +216,18 @@ def high_perf_mtgr_sparse_attn_kernel(
                     q_packed_start = q_seq_starts[b_i] + q_start_live - prefix_len_b
                     seg_end_offset = segment_offsets[b_i, seg_id + 1]
 
-                    next_seg_first_tile = s_local
+                    tiles_this_batch = tiles_prefix_sum[b_i + 1] - tiles_prefix_sum[b_i]
+                    next_seg_first_tile = tiles_this_batch
                     for _k in T.serial(max_splits):
                         next_seg_first_tile = T.if_then_else(
-                            (_k > s_local) & (split_points[b_i, _k] < seg_end_offset), _k, next_seg_first_tile
+                            (_k > s_local)
+                            & (_k <= tiles_this_batch)
+                            & (split_points[b_i, _k] >= seg_end_offset)
+                            & (_k < next_seg_first_tile),
+                            _k,
+                            next_seg_first_tile,
                         )
-                    tiles_this_batch = tiles_prefix_sum[b_i + 1] - tiles_prefix_sum[b_i]
-                    kv_iter_end = T.if_then_else(rule == 1, T.if_then_else(next_seg_first_tile > s_local, next_seg_first_tile + 1, tiles_this_batch), s_local + 1)
+                    kv_iter_end = T.if_then_else(rule == 1, next_seg_first_tile, s_local + 1)
 
                     # 计算有效 K 切片数量（Cube 无法读写 UB，仅计数）
                     seg_start = segment_offsets[b_i, seg_id]
@@ -231,10 +236,17 @@ def high_perf_mtgr_sparse_attn_kernel(
                     valid_k_total = 0
                     for k_i in T.serial(kv_iter_end):
                         kv_start_k = split_points[b_i, k_i]
+                        kv_end_k = split_points[b_i, k_i + 1]
                         process_cond = (
                             ((rule == 0) & (kv_start_k <= max_row_pos))
                             | ((rule == 1) & (kv_start_k < seg_end))
-                            | ((rule == 2) & ((kv_start_k <= seg_start) | (kv_start_k <= max_row_pos)))
+                            | (
+                                (rule == 2)
+                                & (
+                                    (kv_start_k < seg_start)
+                                    | ((kv_start_k < q_end) & (kv_end_k > q_start))
+                                )
+                            )
                         )
                         if process_cond:
                             valid_k_total += 1
@@ -259,10 +271,17 @@ def high_perf_mtgr_sparse_attn_kernel(
                             target = k_outer * num_stages + i
                             for k_scan in T.serial(kv_iter_end):
                                 kv_scan_start = split_points[b_i, k_scan]
+                                kv_scan_end = split_points[b_i, k_scan + 1]
                                 process_cond_scan = (
                                     ((rule == 0) & (kv_scan_start <= max_row_pos))
                                     | ((rule == 1) & (kv_scan_start < seg_end))
-                                    | ((rule == 2) & ((kv_scan_start <= seg_start) | (kv_scan_start <= max_row_pos)))
+                                    | (
+                                        (rule == 2)
+                                        & (
+                                            (kv_scan_start < seg_start)
+                                            | ((kv_scan_start < q_end) & (kv_scan_end > q_start))
+                                        )
+                                    )
                                 )
                                 scan_k_idx = T.if_then_else(process_cond_scan & (scan_count == target), k_scan, scan_k_idx)
                                 scan_count = T.if_then_else(process_cond_scan, scan_count + 1, scan_count)
@@ -320,10 +339,17 @@ def high_perf_mtgr_sparse_attn_kernel(
                             target = k_outer * num_stages + i
                             for k_scan in T.serial(kv_iter_end):
                                 kv_scan_start = split_points[b_i, k_scan]
+                                kv_scan_end = split_points[b_i, k_scan + 1]
                                 process_cond_scan = (
                                     ((rule == 0) & (kv_scan_start <= max_row_pos))
                                     | ((rule == 1) & (kv_scan_start < seg_end))
-                                    | ((rule == 2) & ((kv_scan_start <= seg_start) | (kv_scan_start <= max_row_pos)))
+                                    | (
+                                        (rule == 2)
+                                        & (
+                                            (kv_scan_start < seg_start)
+                                            | ((kv_scan_start < q_end) & (kv_scan_end > q_start))
+                                        )
+                                    )
                                 )
                                 scan_k_idx = T.if_then_else(process_cond_scan & (scan_count == target), k_scan, scan_k_idx)
                                 scan_count = T.if_then_else(process_cond_scan, scan_count + 1, scan_count)
@@ -429,17 +455,23 @@ def high_perf_mtgr_sparse_attn_kernel(
                     q_packed_start = q_seq_starts[b_i] + q_start_live - prefix_len_b
                     seg_end_offset = segment_offsets[b_i, seg_id + 1]
 
-                    next_seg_first_tile = s_local
+                    tiles_this_batch = tiles_prefix_sum[b_i + 1] - tiles_prefix_sum[b_i]
+                    next_seg_first_tile = tiles_this_batch
                     for _k in T.serial(max_splits):
                         next_seg_first_tile = T.if_then_else(
-                            (_k > s_local) & (split_points[b_i, _k] < seg_end_offset), _k, next_seg_first_tile
+                            (_k > s_local)
+                            & (_k <= tiles_this_batch)
+                            & (split_points[b_i, _k] >= seg_end_offset)
+                            & (_k < next_seg_first_tile),
+                            _k,
+                            next_seg_first_tile,
                         )
-                    tiles_this_batch = tiles_prefix_sum[b_i + 1] - tiles_prefix_sum[b_i]
-                    kv_iter_end = T.if_then_else(rule == 1, T.if_then_else(next_seg_first_tile > s_local, next_seg_first_tile + 1, tiles_this_batch), s_local + 1)
+                    kv_iter_end = T.if_then_else(rule == 1, next_seg_first_tile, s_local + 1)
 
                     valid_k_total = 0
                     for k_i in T.serial(kv_iter_end):
                         kv_start = split_points[b_i, k_i]
+                        kv_end = split_points[b_i, k_i + 1]
                         seg_start = segment_offsets[b_i, seg_id]
                         seg_end = segment_offsets[b_i, seg_id + 1]
                         max_row_pos = q_start + q_tile_size - 1
@@ -447,7 +479,13 @@ def high_perf_mtgr_sparse_attn_kernel(
                         process_cond = (
                             ((rule == 0) & (kv_start <= max_row_pos))
                             | ((rule == 1) & (kv_start < seg_end))
-                            | ((rule == 2) & ((kv_start <= seg_start) | (kv_start <= max_row_pos)))
+                            | (
+                                (rule == 2)
+                                & (
+                                    (kv_start < seg_start)
+                                    | ((kv_start < q_end) & (kv_end > q_start))
+                                )
+                            )
                         )
                         if process_cond:
                             valid_k_indices[valid_k_total] = k_i
@@ -697,11 +735,6 @@ def high_perf_sparse_attn_wrapper(
     )
 
     # print(func.get_kernel_source()) # 可以解除注释打印算子源码验证
-    print(q_seq_starts_i32)
-    print(split_points_i32)
-    print(tiles_prefix_sum_i32)
-    print(segment_offsets_padded_i32)
-    print(segment_rules_padded_i32)
 
     func(
         query,
@@ -972,38 +1005,70 @@ if __name__ == "__main__":
             "H": 8,
             "D": 128,
             "seg_lengths": [
-                [2200, 200, 1024],
-                [1700, 300, 1100],
-                [2440, 200, 2048],
-                [1600, 400, 1800],
-                [2200, 200, 1300],
-                [1700, 300, 2048],
-                [1680, 300, 1024],
-                [2048, 700, 1800],
+                [2200, 8, 200, 1024],
+                [1700, 8, 100, 1100],
+                [2440, 8, 200, 2048],
+                [1600, 8, 600, 1900],
+                [3300, 8, 200, 1300],
+                [1700, 8, 300, 2100],
+                [1780, 8, 700, 1200],
+                [2048, 8, 500, 1800],
             ],
-            "rules": [1, 0, 2],
+            "rules": [0, 1, 2, 2],
             "matched_prefix_arr": [0, 0, 0, 0, 0, 0, 0, 0],
         },
-        {
-            "H": 8,
-            "D": 64,
-            "seg_lengths": [
-                [2200, 200, 1024],
-                [1700, 300, 1100],
-            ],
-            "rules": [1, 0, 2],
-            "matched_prefix_arr": [0, 0],
-        },
-        {
-            "H": 8,
-            "D": 128,
-            "seg_lengths": [
-                [2200, 200, 1024],
-                [1700, 300, 1100],
-            ],
-            "rules": [1, 0, 2],
-            "matched_prefix_arr": [128, 256],
-        },
+        # {
+        #     "H": 8,
+        #     "D": 64,
+        #     "seg_lengths": [
+        #         [2200, 8, 200, 1024],
+        #         [1700, 8, 300, 1100],
+        #         [2440, 8, 200, 2048],
+        #         [1600, 8, 600, 1800],
+        #         [3300, 8, 200, 1300],
+        #         [1700, 8, 300, 2048],
+        #         [1780, 8, 300, 1024],
+        #         [2048, 8, 500, 1800],
+        #     ],
+        #     "rules": [0, 1, 0, 2],
+        #     "matched_prefix_arr": [0, 0, 0, 0, 0, 0, 0, 0],
+        # },
+        # {
+        #     "H": 8,
+        #     "D": 128,
+        #     "seg_lengths": [
+        #         [2200, 200, 1024],
+        #         [1700, 300, 1100],
+        #         [2440, 200, 2048],
+        #         [1600, 400, 1800],
+        #         [2200, 200, 1300],
+        #         [1700, 300, 2048],
+        #         [180, 300, 1024],
+        #         [2048, 700, 1800],
+        #     ],
+        #     "rules": [1, 0, 2],
+        #     "matched_prefix_arr": [0, 0, 0, 0, 0, 0, 0, 0],
+        # },
+        # {
+        #     "H": 8,
+        #     "D": 64,
+        #     "seg_lengths": [
+        #         [2200, 200, 1024],
+        #         [1700, 300, 1100],
+        #     ],
+        #     "rules": [1, 0, 2],
+        #     "matched_prefix_arr": [0, 0],
+        # },
+        # {
+        #     "H": 8,
+        #     "D": 128,
+        #     "seg_lengths": [
+        #         [2200, 200, 1024],
+        #         [1700, 300, 1100],
+        #     ],
+        #     "rules": [1, 0, 2],
+        #     "matched_prefix_arr": [128, 256],
+        # },
     ]
 
     for config in test_configs:
