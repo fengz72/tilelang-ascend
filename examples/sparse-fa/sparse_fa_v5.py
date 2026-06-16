@@ -6,8 +6,7 @@ import tilelang
 import tilelang.language as T
 from tilelang.intrinsics import make_zn_layout, make_nz_layout
 
-# 初始化环境
-torch.manual_seed(0)
+torch.manual_seed(41)
 tilelang.disable_cache()
 tilelang.cache.clear_cache()
 
@@ -20,7 +19,7 @@ PASS_CONFIGS = {
     tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_COMBINE: False,
     tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_SYNC: False,
     tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: False,
-    tilelang.PassConfigKey.TL_ASCEND_MEMORY_PLANNING: False,  # 使用手动规划与双缓冲
+    tilelang.PassConfigKey.TL_ASCEND_MEMORY_PLANNING: False,
 }
 
 
@@ -133,35 +132,30 @@ def high_perf_mtgr_sparse_attn_kernel(
             # 用于存储平铺流水线的真实有效 k 索引
             valid_k_indices = T.alloc_ub([max_splits], "int32")
 
-            T.annotate_address({
-                l0a_s: 0,
-                l0a_o: 0,
-
-                l0b_s: 0,
-                l0b_o: 0,
-
-                l0c_s: 0,
-                l0c_o_0: 0,
-                l0c_o_1: block_M * block_N * 4,
-
-                acc_o: 0,
-                r_factors: half_M * dim * 4,
-                sumexp_is: half_M * dim * 4 + num_stages * half_M * 4,
-                sumexp: half_M * dim * 4 + num_stages * half_M * 4 * 2,
-                neg_sm: half_M * dim * 4 + num_stages * half_M * 4 * 2 + half_M * 4,
-
-                io_buf: half_M * dim * 4 + num_stages * half_M * 4 * 2 + half_M * 12,
-                o_io_buf: half_M * dim * 4 + num_stages * half_M * 4 * 2 + half_M * 12,
-
-                acc_s_half: half_M * dim * 4 + num_stages * half_M * 4 * 2 + half_M * 12 + half_M * block_N * 2,
-                o_acc_half: half_M * dim * 4 + num_stages * half_M * 4 * 2 + half_M * 12 + half_M * block_N * 2,
-
-                work_ub: half_M * dim * 4 + num_stages * half_M * 4 * 2 + half_M * 12 + half_M * block_N * 4,
-                o_work_buf: half_M * dim * 4 + num_stages * half_M * 4 * 2 + half_M * 12 + half_M * block_N * 4,
-
-                buf_2d: half_M * dim * 4 + num_stages * half_M * 4 * 2 + half_M * 12 + half_M * block_N * 8,
-                bcast_buf: half_M * dim * 4 + num_stages * half_M * 4 * 2 + half_M * 12 + half_M * block_N * 8,
-            })
+            T.annotate_address(
+                {
+                    l0a_s: 0,
+                    l0a_o: 0,
+                    l0b_s: 0,
+                    l0b_o: 0,
+                    l0c_s: 0,
+                    l0c_o_0: 0,
+                    l0c_o_1: block_M * block_N * 4,
+                    acc_o: 0,
+                    r_factors: half_M * dim * 4,
+                    sumexp_is: half_M * dim * 4 + num_stages * half_M * 4,
+                    sumexp: half_M * dim * 4 + num_stages * half_M * 4 * 2,
+                    neg_sm: half_M * dim * 4 + num_stages * half_M * 4 * 2 + half_M * 4,
+                    io_buf: half_M * dim * 4 + num_stages * half_M * 4 * 2 + half_M * 12,
+                    o_io_buf: half_M * dim * 4 + num_stages * half_M * 4 * 2 + half_M * 12,
+                    acc_s_half: half_M * dim * 4 + num_stages * half_M * 4 * 2 + half_M * 12 + half_M * block_N * 2,
+                    o_acc_half: half_M * dim * 4 + num_stages * half_M * 4 * 2 + half_M * 12 + half_M * block_N * 2,
+                    work_ub: half_M * dim * 4 + num_stages * half_M * 4 * 2 + half_M * 12 + half_M * block_N * 4,
+                    o_work_buf: half_M * dim * 4 + num_stages * half_M * 4 * 2 + half_M * 12 + half_M * block_N * 4,
+                    buf_2d: half_M * dim * 4 + num_stages * half_M * 4 * 2 + half_M * 12 + half_M * block_N * 8,
+                    bcast_buf: half_M * dim * 4 + num_stages * half_M * 4 * 2 + half_M * 12 + half_M * block_N * 8,
+                }
+            )
 
             b_i = T.alloc_var("int32", init=0)
             seg_id = T.alloc_var("int32", init=0)
@@ -240,13 +234,7 @@ def high_perf_mtgr_sparse_attn_kernel(
                         process_cond = (
                             ((rule == 0) & (kv_start_k <= max_row_pos))
                             | ((rule == 1) & (kv_start_k < seg_end))
-                            | (
-                                (rule == 2)
-                                & (
-                                    (kv_start_k < seg_start)
-                                    | ((kv_start_k < q_end) & (kv_end_k > q_start))
-                                )
-                            )
+                            | ((rule == 2) & ((kv_start_k < seg_start) | ((kv_start_k < q_end) & (kv_end_k > q_start))))
                         )
                         if process_cond:
                             valid_k_total += 1
@@ -275,13 +263,7 @@ def high_perf_mtgr_sparse_attn_kernel(
                                 process_cond_scan = (
                                     ((rule == 0) & (kv_scan_start <= max_row_pos))
                                     | ((rule == 1) & (kv_scan_start < seg_end))
-                                    | (
-                                        (rule == 2)
-                                        & (
-                                            (kv_scan_start < seg_start)
-                                            | ((kv_scan_start < q_end) & (kv_scan_end > q_start))
-                                        )
-                                    )
+                                    | ((rule == 2) & ((kv_scan_start < seg_start) | ((kv_scan_start < q_end) & (kv_scan_end > q_start))))
                                 )
                                 scan_k_idx = T.if_then_else(process_cond_scan & (scan_count == target), k_scan, scan_k_idx)
                                 scan_count = T.if_then_else(process_cond_scan, scan_count + 1, scan_count)
@@ -343,13 +325,7 @@ def high_perf_mtgr_sparse_attn_kernel(
                                 process_cond_scan = (
                                     ((rule == 0) & (kv_scan_start <= max_row_pos))
                                     | ((rule == 1) & (kv_scan_start < seg_end))
-                                    | (
-                                        (rule == 2)
-                                        & (
-                                            (kv_scan_start < seg_start)
-                                            | ((kv_scan_start < q_end) & (kv_scan_end > q_start))
-                                        )
-                                    )
+                                    | ((rule == 2) & ((kv_scan_start < seg_start) | ((kv_scan_start < q_end) & (kv_scan_end > q_start))))
                                 )
                                 scan_k_idx = T.if_then_else(process_cond_scan & (scan_count == target), k_scan, scan_k_idx)
                                 scan_count = T.if_then_else(process_cond_scan, scan_count + 1, scan_count)
@@ -479,13 +455,7 @@ def high_perf_mtgr_sparse_attn_kernel(
                         process_cond = (
                             ((rule == 0) & (kv_start <= max_row_pos))
                             | ((rule == 1) & (kv_start < seg_end))
-                            | (
-                                (rule == 2)
-                                & (
-                                    (kv_start < seg_start)
-                                    | ((kv_start < q_end) & (kv_end > q_start))
-                                )
-                            )
+                            | ((rule == 2) & ((kv_start < seg_start) | ((kv_start < q_end) & (kv_end > q_start))))
                         )
                         if process_cond:
                             valid_k_indices[valid_k_total] = k_i
@@ -713,12 +683,8 @@ def high_perf_sparse_attn_wrapper(
     prefix_list = matched_prefix_lens_i32.cpu().tolist()
     for b_idx, plen in enumerate(prefix_list):
         if plen % block_N != 0:
-            raise ValueError(
-                f"matched_prefix_lens[{b_idx}] = {plen} is not a multiple of block_N={block_N}"
-            )
+            raise ValueError(f"matched_prefix_lens[{b_idx}] = {plen} is not a multiple of block_N={block_N}")
 
-    print("开始编译kernel")
-    # 获得编译好的 JIT Kernel
     func = high_perf_mtgr_sparse_attn_kernel(
         heads=H,
         dim=D,
@@ -731,10 +697,10 @@ def high_perf_sparse_attn_wrapper(
         num_stages=num_stages,
         max_splits=max_splits,
         max_segs=max_segs,
-        cross_interval=cross_interval
+        cross_interval=cross_interval,
     )
 
-    # print(func.get_kernel_source()) # 可以解除注释打印算子源码验证
+    # print(func.get_kernel_source())
 
     func(
         query,
@@ -759,6 +725,7 @@ def high_perf_sparse_attn_wrapper(
     torch.npu.synchronize()
     return output
 
+
 def golden_attention(
     query_snd,
     key_snd,
@@ -775,9 +742,7 @@ def golden_attention(
 ):
     B = segment_offsets_i32.size(0)
     D = query_snd.size(2)
-    H = query_snd.size(1)
     kv_heads = key_snd.size(1)
-    total_live_q = query_snd.size(0)
 
     q_starts = q_seq_starts_i32.cpu().tolist()
     matched_prefix_list = matched_prefix_lens_i32.cpu().tolist()
@@ -852,6 +817,7 @@ def golden_attention(
 
     ref_output = torch.cat(ref_outputs, dim=0)
     return ref_output
+
 
 def test(
     H,
@@ -951,7 +917,6 @@ def test(
     for b in range(B):
         prefix_len = matched_prefix_arr[b]
         live_offsets_list.append([max(0, o - prefix_len) for o in offsets_list[b]])
-    segment_offsets_live_i32 = torch.tensor(live_offsets_list, dtype=torch.int32, device="cpu")
 
     sm_scale = 1.0 / math.sqrt(D)
 
@@ -1017,58 +982,6 @@ if __name__ == "__main__":
             "rules": [0, 1, 2, 2],
             "matched_prefix_arr": [0, 0, 0, 0, 0, 0, 0, 0],
         },
-        # {
-        #     "H": 8,
-        #     "D": 64,
-        #     "seg_lengths": [
-        #         [2200, 8, 200, 1024],
-        #         [1700, 8, 300, 1100],
-        #         [2440, 8, 200, 2048],
-        #         [1600, 8, 600, 1800],
-        #         [3300, 8, 200, 1300],
-        #         [1700, 8, 300, 2048],
-        #         [1780, 8, 300, 1024],
-        #         [2048, 8, 500, 1800],
-        #     ],
-        #     "rules": [0, 1, 0, 2],
-        #     "matched_prefix_arr": [0, 0, 0, 0, 0, 0, 0, 0],
-        # },
-        # {
-        #     "H": 8,
-        #     "D": 128,
-        #     "seg_lengths": [
-        #         [2200, 200, 1024],
-        #         [1700, 300, 1100],
-        #         [2440, 200, 2048],
-        #         [1600, 400, 1800],
-        #         [2200, 200, 1300],
-        #         [1700, 300, 2048],
-        #         [180, 300, 1024],
-        #         [2048, 700, 1800],
-        #     ],
-        #     "rules": [1, 0, 2],
-        #     "matched_prefix_arr": [0, 0, 0, 0, 0, 0, 0, 0],
-        # },
-        # {
-        #     "H": 8,
-        #     "D": 64,
-        #     "seg_lengths": [
-        #         [2200, 200, 1024],
-        #         [1700, 300, 1100],
-        #     ],
-        #     "rules": [1, 0, 2],
-        #     "matched_prefix_arr": [0, 0],
-        # },
-        # {
-        #     "H": 8,
-        #     "D": 128,
-        #     "seg_lengths": [
-        #         [2200, 200, 1024],
-        #         [1700, 300, 1100],
-        #     ],
-        #     "rules": [1, 0, 2],
-        #     "matched_prefix_arr": [128, 256],
-        # },
     ]
 
     for config in test_configs:
