@@ -1,10 +1,11 @@
 # msprof op --kernel-name="main_kernel" --output="./log" python examples/sparse-fa/sparse_fa_v5.py
 
-import math
 import torch
 import tilelang
 import tilelang.language as T
 from tilelang.intrinsics import make_zn_layout, make_nz_layout
+from golden import golden_attention_float64
+from testcase import prepare_data
 
 torch.manual_seed(41)
 tilelang.disable_cache()
@@ -38,16 +39,15 @@ def high_perf_mtgr_sparse_attn_kernel(
     num_stages=14,
     cross_interval=2,
     max_splits=32,
-    max_segs=4,
 ):
     sm_scale = (1.0 / dim) ** 0.5 if sm_scale is None else sm_scale
-    dtype = "bfloat16"  # HBM 搬运动力最佳格式
-    accum_dtype = "float32"  # 关键中间累加采用 FP32 防溢出
+    dtype = "bfloat16"
+    accum_dtype = "float32"
 
     batch = T.symbolic("batch")
     total_q = T.symbolic("total_q")
-    total_seq_tiles = T.symbolic("total_seq_tiles")
-    max_blocks = T.symbolic("max_blocks_per_req")
+    max_blocks = T.symbolic("max_blocks")
+    max_segs = T.symbolic("max_segs")
 
     kv_heads = heads // kv_group
     half_M = block_M // 2
@@ -79,7 +79,6 @@ def high_perf_mtgr_sparse_attn_kernel(
         tiles_prefix_sum: T.Tensor([batch + 1], "int32"),
         segment_offsets: T.Tensor([batch, max_segs + 1], "int32"),
         segment_rules: T.Tensor([max_segs], "int32"),
-        # 使用动态流水线槽位
         workspace_1: T.Tensor([core_num, num_stages, block_M, block_N], dtype),
         workspace_2: T.Tensor([core_num, num_stages, block_M, block_N], dtype),
         workspace_3: T.Tensor([core_num, num_stages, block_M, dim], dtype),
@@ -87,7 +86,7 @@ def high_perf_mtgr_sparse_attn_kernel(
         value_cache: T.Tensor([num_blocks, block_N, kv_heads, dim], dtype),
         block_table: T.Tensor([batch, max_blocks], "int32"),
         prefix_lens: T.Tensor([batch], "int32"),
-        _dummy: T.Tensor([total_seq_tiles], "int32"),
+        total_seq_tiles: T.int32
     ):
         with T.Kernel(core_num, is_npu=True) as (cid, vid):
             q_l1 = T.alloc_L1([block_M, dim], dtype)
@@ -597,7 +596,7 @@ def high_perf_mtgr_sparse_attn_kernel(
 # ---------------------------------------------------------------------------
 def compute_split_points(seg_lengths, block_M):
     splits = [0]
-    for seg_id, length in enumerate(seg_lengths):
+    for _, length in enumerate(seg_lengths):
         seg_start = splits[-1]
         seg_end = seg_start + length
         pos = seg_start
@@ -632,20 +631,23 @@ def high_perf_sparse_attn_wrapper(
     B = segment_offsets_i32.size(0)
     H = query.size(1)
     D = query.size(2)
+    max_segs = segment_offsets_i32.size(1) - 1
+
+    assert segment_offsets_i32.size(1) == max_segs + 1, \
+        f"segment_offsets_i32 shape {segment_offsets_i32.shape} != [batch={B}, max_segs+1={max_segs + 1}]"
+    assert segment_rules_i32.size(0) == max_segs, \
+        f"segment_rules_i32 shape {segment_rules_i32.shape} != [max_segs={max_segs}]"
 
     seg_lengths_list = []
     for b in range(B):
         offsets = segment_offsets_i32[b].cpu().tolist()
-        lengths = [offsets[i + 1] - offsets[i] for i in range(len(offsets) - 1)]
+        lengths = [offsets[i + 1] - offsets[i] for i in range(max_segs)]
         seg_lengths_list.append(lengths)
 
     max_splits = 0
-    max_segs = 0
     all_split_points = []
 
     for b in range(B):
-        num_segs_b = len(seg_lengths_list[b])
-        max_segs = max(max_segs, num_segs_b)
         splits = compute_split_points(seg_lengths_list[b], block_M)
         all_split_points.append(splits)
         max_splits = max(max_splits, len(splits))
@@ -655,15 +657,6 @@ def high_perf_sparse_attn_wrapper(
         split_points_padded.append(sp + [0] * (max_splits - len(sp)))
     split_points_i32 = torch.tensor(split_points_padded, dtype=torch.int32, device=query.device)
 
-    seg_offsets_padded = []
-    for b in range(B):
-        offsets = segment_offsets_i32[b].cpu().tolist()
-        seg_offsets_padded.append(offsets + [0] * (max_segs + 1 - len(offsets)))
-    segment_offsets_padded_i32 = torch.tensor(seg_offsets_padded, dtype=torch.int32, device=query.device)
-
-    rules_padded = segment_rules_i32.cpu().tolist() + [0] * (max_segs - len(segment_rules_i32))
-    segment_rules_padded_i32 = torch.tensor(rules_padded, dtype=torch.int32, device=query.device)
-
     tiles_per_batch = [len(sp) - 1 for sp in all_split_points]
     total_seq_tiles = sum(tiles_per_batch)
 
@@ -672,18 +665,10 @@ def high_perf_sparse_attn_wrapper(
         tiles_prefix_sum_list.append(tiles_prefix_sum_list[-1] + t)
     tiles_prefix_sum_i32 = torch.tensor(tiles_prefix_sum_list, dtype=torch.int32, device=query.device)
 
-    # Workspace 申请 （支持 num_stages 大小）
-    # HBM 大约消耗 = 24 * 4 * 128 * 128 * 2(float16) = 3MB，这在显存中完全微不足道。
     ws1 = torch.empty((core_num, num_stages, block_M, block_N), dtype=torch.bfloat16, device=query.device)
     ws2 = torch.empty((core_num, num_stages, block_M, block_N), dtype=torch.bfloat16, device=query.device)
     ws3 = torch.empty((core_num, num_stages, block_M, D), dtype=torch.bfloat16, device=query.device)
     output = torch.empty_like(query)
-    dummy_tensor = torch.empty(total_seq_tiles, dtype=torch.int32, device=query.device)
-
-    prefix_list = matched_prefix_lens_i32.cpu().tolist()
-    for b_idx, plen in enumerate(prefix_list):
-        if plen % block_N != 0:
-            raise ValueError(f"matched_prefix_lens[{b_idx}] = {plen} is not a multiple of block_N={block_N}")
 
     func = high_perf_mtgr_sparse_attn_kernel(
         heads=H,
@@ -696,7 +681,6 @@ def high_perf_sparse_attn_wrapper(
         core_num=core_num,
         num_stages=num_stages,
         max_splits=max_splits,
-        max_segs=max_segs,
         cross_interval=cross_interval,
     )
 
@@ -710,8 +694,8 @@ def high_perf_sparse_attn_wrapper(
         q_seq_starts_i32.to(query.device),
         split_points_i32,
         tiles_prefix_sum_i32,
-        segment_offsets_padded_i32,
-        segment_rules_padded_i32,
+        segment_offsets_i32,
+        segment_rules_i32,
         ws1,
         ws2,
         ws3,
@@ -719,244 +703,54 @@ def high_perf_sparse_attn_wrapper(
         value_cache,
         block_table_i32,
         matched_prefix_lens_i32,
-        dummy_tensor,
+        total_seq_tiles
     )
 
     torch.npu.synchronize()
     return output
 
 
-def golden_attention(
-    query_snd,
-    key_snd,
-    value_snd,
-    segment_offsets_i32,
-    segment_rules_i32,
-    q_seq_starts_i32,
-    matched_prefix_lens_i32,
-    key_cache,
-    value_cache,
-    block_table_i32,
-    block_size,
-    sm_scale,
-):
-    B = segment_offsets_i32.size(0)
-    D = query_snd.size(2)
-    kv_heads = key_snd.size(1)
-
-    q_starts = q_seq_starts_i32.cpu().tolist()
-    matched_prefix_list = matched_prefix_lens_i32.cpu().tolist()
-
-    q_lens = [q_starts[b + 1] - q_starts[b] for b in range(B)]
-
-    ref_outputs = []
-    for b in range(B):
-        q_start = q_starts[b]
-        q_len = q_lens[b]
-        q_b = query_snd[q_start : q_start + q_len].float()
-
-        prefix_len = matched_prefix_list[b]
-
-        if prefix_len > 0:
-            num_prefix_blocks = (prefix_len + block_size - 1) // block_size
-            phys_blocks = block_table_i32[b, :num_prefix_blocks]
-            k_prefix_b = key_cache[phys_blocks].reshape(-1, kv_heads, D)[:prefix_len].float()
-            v_prefix_b = value_cache[phys_blocks].reshape(-1, kv_heads, D)[:prefix_len].float()
-
-        k_live_b = key_snd[q_start : q_start + q_len].float()
-        v_live_b = value_snd[q_start : q_start + q_len].float()
-
-        if prefix_len > 0:
-            k_full_b = torch.cat([k_prefix_b, k_live_b], dim=0)
-            v_full_b = torch.cat([v_prefix_b, v_live_b], dim=0)
-        else:
-            k_full_b = k_live_b
-            v_full_b = v_live_b
-
-        total_kv_len_b = prefix_len + q_len
-
-        offsets = segment_offsets_i32[b].cpu().tolist()
-        rules = segment_rules_i32.cpu().tolist()
-
-        live_offsets = [max(0, o - prefix_len) for o in offsets]
-        live_positions = torch.arange(q_len)
-        offsets_tensor = torch.tensor(live_offsets, dtype=torch.int32)
-        seg_ids = torch.searchsorted(offsets_tensor[1:], live_positions, right=True)
-
-        mask_b = torch.zeros(q_len, q_len, dtype=torch.float32)
-        for seg_id_val in range(len(rules)):
-            rule = rules[seg_id_val]
-            q_indices = (seg_ids == seg_id_val).nonzero().squeeze(-1)
-            if q_indices.numel() == 0:
-                continue
-            if rule == 0:
-                k_range = torch.arange(q_len)
-                causal_mask = k_range.unsqueeze(0) <= live_positions[q_indices].unsqueeze(1)
-                mask_b[q_indices] = causal_mask.float()
-            elif rule == 1:
-                end = live_offsets[seg_id_val + 1]
-                mask_b[q_indices, :end] = 1.0
-            elif rule == 2:
-                start = live_offsets[seg_id_val]
-                mask_b[q_indices, :start] = 1.0
-                mask_b[q_indices, live_positions[q_indices]] = 1.0
-
-        full_mask = torch.zeros(q_len, total_kv_len_b, dtype=torch.float32)
-        if prefix_len > 0:
-            full_mask[:, :prefix_len] = 1.0
-        full_mask[:, prefix_len:] = mask_b
-
-        scores = torch.einsum("qhd,khd->hqk", q_b, k_full_b) * sm_scale
-        scores = scores.masked_fill(
-            full_mask.unsqueeze(0) == 0.0,
-            float("-inf"),
-        )
-        probs = torch.softmax(scores, dim=-1).nan_to_num(0.0)
-        ref_b = torch.einsum("hqk,khd->qhd", probs, v_full_b).to(torch.bfloat16)
-        ref_outputs.append(ref_b)
-
-    ref_output = torch.cat(ref_outputs, dim=0)
-    return ref_output
-
-
-def test(
-    H,
-    D,
-    seg_lengths,
-    rules,
-    matched_prefix_arr,
-    kv_group=1,
-    block_M=128,
-    block_N=128,
-    block_size=128,
-    core_num=24,
-    num_stages=14,
-    cross_interval=2,
-):
-    B = len(seg_lengths)
-    kv_heads = H // kv_group
-    assert block_size == block_N
-
-    S_logical_list = [sum(sl) for sl in seg_lengths]
-
-    offsets_list = []
-    for sl in seg_lengths:
-        off = [0]
-        for s in sl:
-            off.append(off[-1] + s)
-        offsets_list.append(off)
-
-    actual_q_len_arr = [S_logical_list[b] - matched_prefix_arr[b] for b in range(B)]
-
-    q_seq_starts_arr = [0]
-    for b in range(1, B):
-        q_seq_starts_arr.append(q_seq_starts_arr[b - 1] + actual_q_len_arr[b - 1])
-    q_seq_starts_arr.append(q_seq_starts_arr[B - 1] + actual_q_len_arr[B - 1])
-
-    q_list = []
-    k_list_full = []
-    v_list_full = []
-    k_list_live = []
-    v_list_live = []
-    for b in range(B):
-        q_b = torch.randn(actual_q_len_arr[b], H, D, dtype=torch.float32, device="cpu").to(torch.bfloat16)
-        k_b_full = torch.randn(S_logical_list[b], kv_heads, D, dtype=torch.float32, device="cpu").to(torch.bfloat16)
-        v_b_full = torch.randn(S_logical_list[b], kv_heads, D, dtype=torch.float32, device="cpu").to(torch.bfloat16)
-        q_list.append(q_b)
-        k_list_full.append(k_b_full)
-        v_list_full.append(v_b_full)
-
-        prefix_len = matched_prefix_arr[b]
-        k_list_live.append(k_b_full[prefix_len:])
-        v_list_live.append(v_b_full[prefix_len:])
-
-    query_snd = torch.cat(q_list, dim=0)
-    key_snd = torch.cat(k_list_live, dim=0)
-    value_snd = torch.cat(v_list_live, dim=0)
-
-    num_cache_blocks = max(1, sum((matched_prefix_arr[b] + block_size - 1) // block_size for b in range(B)))
-    key_cache = torch.zeros(num_cache_blocks, block_size, kv_heads, D, dtype=torch.bfloat16, device="cpu")
-    value_cache = torch.zeros(num_cache_blocks, block_size, kv_heads, D, dtype=torch.bfloat16, device="cpu")
-
-    block_table_arr = []
-    physical_block_offset = 0
-    for b in range(B):
-        prefix_len = matched_prefix_arr[b]
-        num_logical_blocks = (S_logical_list[b] + block_size - 1) // block_size
-        bt_row = []
-        for lb in range(num_logical_blocks):
-            if lb < (prefix_len + block_size - 1) // block_size:
-                bt_row.append(physical_block_offset + lb)
-            else:
-                bt_row.append(0)
-        block_table_arr.append(bt_row)
-        physical_block_offset += (prefix_len + block_size - 1) // block_size
-
-    for b in range(B):
-        prefix_len = matched_prefix_arr[b]
-        if prefix_len > 0:
-            for p in range(prefix_len):
-                block_idx = p // block_size
-                block_offset = p % block_size
-                physical_block = block_table_arr[b][block_idx]
-                key_cache[physical_block, block_offset, :, :] = k_list_full[b][p, :, :]
-                value_cache[physical_block, block_offset, :, :] = v_list_full[b][p, :, :]
-
-    max_blocks_per_request = max(1, max(len(bt) for bt in block_table_arr))
-    block_table_tensor = torch.zeros(B, max_blocks_per_request, dtype=torch.int32, device="cpu")
-    for b in range(B):
-        for lb in range(len(block_table_arr[b])):
-            block_table_tensor[b, lb] = block_table_arr[b][lb]
-
-    segment_offsets_i32 = torch.tensor(offsets_list, dtype=torch.int32, device="cpu")
-    segment_rules_i32 = torch.tensor(rules, dtype=torch.int32, device="cpu")
-    q_seq_starts_i32 = torch.tensor(q_seq_starts_arr, dtype=torch.int32, device="cpu")
-    matched_prefix_lens_i32 = torch.tensor(matched_prefix_arr, dtype=torch.int32, device="cpu")
-
-    live_offsets_list = []
-    for b in range(B):
-        prefix_len = matched_prefix_arr[b]
-        live_offsets_list.append([max(0, o - prefix_len) for o in offsets_list[b]])
-
-    sm_scale = 1.0 / math.sqrt(D)
+def test(config, block_M=128, core_num=24, num_stages=14, cross_interval=2):
+    data = prepare_data(config)
+    block_N = config.get("block_N", 128)
 
     torch.npu.synchronize()
     print("init successful!")
 
     output_snd = high_perf_sparse_attn_wrapper(
-        query_snd.npu(),
-        key_snd.npu(),
-        value_snd.npu(),
-        segment_offsets_i32,
-        segment_rules_i32,
-        q_seq_starts_i32,
-        sm_scale,
-        num_blocks=num_cache_blocks,
-        key_cache=key_cache.npu(),
-        value_cache=value_cache.npu(),
-        block_table_i32=block_table_tensor.npu(),
-        matched_prefix_lens_i32=matched_prefix_lens_i32.npu(),
+        data["query_snd"].npu(),
+        data["key_snd"].npu(),
+        data["value_snd"].npu(),
+        data["segment_offsets_i32"].npu(),
+        data["segment_rules_i32"].npu(),
+        data["q_seq_starts_i32"].npu(),
+        data["sm_scale"],
+        num_blocks=data["num_cache_blocks"],
+        key_cache=data["key_cache"].npu(),
+        value_cache=data["value_cache"].npu(),
+        block_table_i32=data["block_table_tensor"].npu(),
+        matched_prefix_lens_i32=data["matched_prefix_lens_i32"].npu(),
         block_M=block_M,
         block_N=block_N,
         core_num=core_num,
-        kv_group=kv_group,
+        kv_group=data["kv_group"],
         num_stages=num_stages,
         cross_interval=cross_interval,
     )
 
-    ref_output = golden_attention(
-        query_snd,
-        key_snd,
-        value_snd,
-        segment_offsets_i32,
-        segment_rules_i32,
-        q_seq_starts_i32,
-        matched_prefix_lens_i32,
-        key_cache,
-        value_cache,
-        block_table_tensor,
-        block_size,
-        sm_scale,
+    ref_output = golden_attention_float64(
+        data["query_snd"],
+        data["key_snd"],
+        data["value_snd"],
+        data["segment_offsets_i32"],
+        data["segment_rules_i32"],
+        data["q_seq_starts_i32"],
+        data["matched_prefix_lens_i32"],
+        data["key_cache"],
+        data["value_cache"],
+        data["block_table_tensor"],
+        data["block_size"],
+        data["sm_scale"],
     )
 
     torch.npu.synchronize()
@@ -985,4 +779,4 @@ if __name__ == "__main__":
     ]
 
     for config in test_configs:
-        test(**config)
+        test(config)

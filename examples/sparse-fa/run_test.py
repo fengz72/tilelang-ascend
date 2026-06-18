@@ -1,122 +1,15 @@
 import argparse
 import csv
 import glob
-import math
 import os
 import subprocess
 import sys
 import time
 import torch
 
-from testcase import test_configs
-from sparse_fa_v5 import high_perf_sparse_attn_wrapper, golden_attention
-
-
-def prepare_data(config):
-    H = config["H"]
-    D = config["D"]
-    seg_lengths = config["seg_lengths"]
-    rules = config["rules"]
-    matched_prefix_arr = config["matched_prefix_arr"]
-    kv_group = config.get("kv_group", 1)
-    block_size = config.get("block_N", 128)
-
-    B = len(seg_lengths)
-    kv_heads = H // kv_group
-
-    S_logical_list = [sum(sl) for sl in seg_lengths]
-
-    offsets_list = []
-    for sl in seg_lengths:
-        off = [0]
-        for s in sl:
-            off.append(off[-1] + s)
-        offsets_list.append(off)
-
-    actual_q_len_arr = [S_logical_list[b] - matched_prefix_arr[b] for b in range(B)]
-
-    q_seq_starts_arr = [0]
-    for b in range(1, B):
-        q_seq_starts_arr.append(q_seq_starts_arr[b - 1] + actual_q_len_arr[b - 1])
-    q_seq_starts_arr.append(q_seq_starts_arr[B - 1] + actual_q_len_arr[B - 1])
-
-    torch.manual_seed(0)
-
-    q_list, k_list_full, v_list_full, k_list_live, v_list_live = [], [], [], [], []
-    for b in range(B):
-        q_b = torch.randn(actual_q_len_arr[b], H, D, dtype=torch.float32, device="cpu").to(torch.bfloat16)
-        k_b_full = torch.randn(S_logical_list[b], kv_heads, D, dtype=torch.float32, device="cpu").to(torch.bfloat16)
-        v_b_full = torch.randn(S_logical_list[b], kv_heads, D, dtype=torch.float32, device="cpu").to(torch.bfloat16)
-        q_list.append(q_b)
-        k_list_full.append(k_b_full)
-        v_list_full.append(v_b_full)
-        prefix_len = matched_prefix_arr[b]
-        k_list_live.append(k_b_full[prefix_len:])
-        v_list_live.append(v_b_full[prefix_len:])
-
-    query_snd = torch.cat(q_list, dim=0)
-    key_snd = torch.cat(k_list_live, dim=0)
-    value_snd = torch.cat(v_list_live, dim=0)
-
-    num_cache_blocks = max(1, sum((matched_prefix_arr[b] + block_size - 1) // block_size for b in range(B)))
-    key_cache = torch.zeros(num_cache_blocks, block_size, kv_heads, D, dtype=torch.bfloat16, device="cpu")
-    value_cache = torch.zeros(num_cache_blocks, block_size, kv_heads, D, dtype=torch.bfloat16, device="cpu")
-
-    block_table_arr = []
-    physical_block_offset = 0
-    for b in range(B):
-        prefix_len = matched_prefix_arr[b]
-        num_logical_blocks = (S_logical_list[b] + block_size - 1) // block_size
-        bt_row = []
-        for lb in range(num_logical_blocks):
-            if lb < (prefix_len + block_size - 1) // block_size:
-                bt_row.append(physical_block_offset + lb)
-            else:
-                bt_row.append(0)
-        block_table_arr.append(bt_row)
-        physical_block_offset += (prefix_len + block_size - 1) // block_size
-
-    for b in range(B):
-        prefix_len = matched_prefix_arr[b]
-        if prefix_len > 0:
-            for p in range(prefix_len):
-                block_idx = p // block_size
-                block_offset = p % block_size
-                physical_block = block_table_arr[b][block_idx]
-                key_cache[physical_block, block_offset, :, :] = k_list_full[b][p, :, :]
-                value_cache[physical_block, block_offset, :, :] = v_list_full[b][p, :, :]
-
-    max_blocks_per_request = max(1, max(len(bt) for bt in block_table_arr))
-    block_table_tensor = torch.zeros(B, max_blocks_per_request, dtype=torch.int32, device="cpu")
-    for b in range(B):
-        for lb in range(len(block_table_arr[b])):
-            block_table_tensor[b, lb] = block_table_arr[b][lb]
-
-    segment_offsets_i32 = torch.tensor(offsets_list, dtype=torch.int32, device="cpu")
-    segment_rules_i32 = torch.tensor(rules, dtype=torch.int32, device="cpu")
-    q_seq_starts_i32 = torch.tensor(q_seq_starts_arr, dtype=torch.int32, device="cpu")
-    matched_prefix_lens_i32 = torch.tensor(matched_prefix_arr, dtype=torch.int32, device="cpu")
-
-    sm_scale = 1.0 / math.sqrt(D)
-
-    return dict(
-        query_snd=query_snd,
-        key_snd=key_snd,
-        value_snd=value_snd,
-        segment_offsets_i32=segment_offsets_i32,
-        segment_rules_i32=segment_rules_i32,
-        q_seq_starts_i32=q_seq_starts_i32,
-        matched_prefix_lens_i32=matched_prefix_lens_i32,
-        key_cache=key_cache,
-        value_cache=value_cache,
-        block_table_tensor=block_table_tensor,
-        num_cache_blocks=num_cache_blocks,
-        sm_scale=sm_scale,
-        H=H,
-        D=D,
-        kv_group=kv_group,
-        block_size=block_size,
-    )
+from testcase import test_configs, prepare_data
+from sparse_fa_v5 import high_perf_sparse_attn_wrapper
+from golden import golden_attention_float64
 
 
 def run_kernel(data, config):
@@ -131,8 +24,8 @@ def run_kernel(data, config):
         data["query_snd"].npu(),
         data["key_snd"].npu(),
         data["value_snd"].npu(),
-        data["segment_offsets_i32"],
-        data["segment_rules_i32"],
+        data["segment_offsets_i32"].npu(),
+        data["segment_rules_i32"].npu(),
         data["q_seq_starts_i32"],
         data["sm_scale"],
         num_blocks=data["num_cache_blocks"],
@@ -152,7 +45,7 @@ def run_kernel(data, config):
 def run_accuracy(data, config, rtol, atol):
     output_snd = run_kernel(data, config)
 
-    ref_output = golden_attention(
+    ref_output = golden_attention_float64(
         data["query_snd"],
         data["key_snd"],
         data["value_snd"],
@@ -262,7 +155,7 @@ def print_summary(results):
 
 def main():
     parser = argparse.ArgumentParser(description="Sparse FlashAttention test runner")
-    parser.add_argument("--mode", choices=["accuracy", "perf", "all"], default="all")
+    parser.add_argument("--mode", choices=["accuracy", "perf", "all"], default="accuracy")
     parser.add_argument("--case-index", type=int, default=None, help="Run a single case by index (0-based)")
     parser.add_argument("--rtol", type=float, default=1e-2)
     parser.add_argument("--atol", type=float, default=1e-2)

@@ -1,135 +1,253 @@
+import math
+import torch
+
+
+def prepare_data(config):
+    H = config["H"]
+    D = config["D"]
+    seg_lengths = config["seg_lengths"]
+    rules = config["rules"]
+    matched_prefix_arr = config["matched_prefix_arr"]
+    kv_group = config.get("kv_group", 1)
+    block_N = config.get("block_N", 128)
+    block_size = block_N
+
+    B = len(seg_lengths)
+    kv_heads = H // kv_group
+
+    for b_idx, plen in enumerate(matched_prefix_arr):
+        if plen % block_N != 0:
+            raise ValueError(
+                f"matched_prefix_arr[{b_idx}] = {plen} is not a multiple of block_N={block_N}"
+            )
+
+    S_logical_list = [sum(sl) for sl in seg_lengths]
+
+    offsets_list = []
+    for sl in seg_lengths:
+        off = [0]
+        for s in sl:
+            off.append(off[-1] + s)
+        offsets_list.append(off)
+
+    actual_q_len_arr = [S_logical_list[b] - matched_prefix_arr[b] for b in range(B)]
+
+    q_seq_starts_arr = [0]
+    for b in range(1, B):
+        q_seq_starts_arr.append(q_seq_starts_arr[b - 1] + actual_q_len_arr[b - 1])
+    q_seq_starts_arr.append(q_seq_starts_arr[B - 1] + actual_q_len_arr[B - 1])
+
+    torch.manual_seed(0)
+
+    q_list, k_list_full, v_list_full, k_list_live, v_list_live = [], [], [], [], []
+    for b in range(B):
+        q_b = torch.randn(actual_q_len_arr[b], H, D, dtype=torch.float32, device="cpu").to(torch.bfloat16)
+        k_b_full = torch.randn(S_logical_list[b], kv_heads, D, dtype=torch.float32, device="cpu").to(torch.bfloat16)
+        v_b_full = torch.randn(S_logical_list[b], kv_heads, D, dtype=torch.float32, device="cpu").to(torch.bfloat16)
+        q_list.append(q_b)
+        k_list_full.append(k_b_full)
+        v_list_full.append(v_b_full)
+        prefix_len = matched_prefix_arr[b]
+        k_list_live.append(k_b_full[prefix_len:])
+        v_list_live.append(v_b_full[prefix_len:])
+
+    query_snd = torch.cat(q_list, dim=0)
+    key_snd = torch.cat(k_list_live, dim=0)
+    value_snd = torch.cat(v_list_live, dim=0)
+
+    num_cache_blocks = max(1, sum((matched_prefix_arr[b] + block_size - 1) // block_size for b in range(B)))
+    key_cache = torch.zeros(num_cache_blocks, block_size, kv_heads, D, dtype=torch.bfloat16, device="cpu")
+    value_cache = torch.zeros(num_cache_blocks, block_size, kv_heads, D, dtype=torch.bfloat16, device="cpu")
+
+    block_table_arr = []
+    physical_block_offset = 0
+    for b in range(B):
+        prefix_len = matched_prefix_arr[b]
+        num_logical_blocks = (S_logical_list[b] + block_size - 1) // block_size
+        bt_row = []
+        for lb in range(num_logical_blocks):
+            if lb < (prefix_len + block_size - 1) // block_size:
+                bt_row.append(physical_block_offset + lb)
+            else:
+                bt_row.append(0)
+        block_table_arr.append(bt_row)
+        physical_block_offset += (prefix_len + block_size - 1) // block_size
+
+    for b in range(B):
+        prefix_len = matched_prefix_arr[b]
+        if prefix_len > 0:
+            for p in range(prefix_len):
+                block_idx = p // block_size
+                block_offset = p % block_size
+                physical_block = block_table_arr[b][block_idx]
+                key_cache[physical_block, block_offset, :, :] = k_list_full[b][p, :, :]
+                value_cache[physical_block, block_offset, :, :] = v_list_full[b][p, :, :]
+
+    max_blocks_per_request = max(1, max(len(bt) for bt in block_table_arr))
+    block_table_tensor = torch.zeros(B, max_blocks_per_request, dtype=torch.int32, device="cpu")
+    for b in range(B):
+        for lb in range(len(block_table_arr[b])):
+            block_table_tensor[b, lb] = block_table_arr[b][lb]
+
+    segment_offsets_i32 = torch.tensor(offsets_list, dtype=torch.int32, device="cpu")
+    segment_rules_i32 = torch.tensor(rules, dtype=torch.int32, device="cpu")
+    q_seq_starts_i32 = torch.tensor(q_seq_starts_arr, dtype=torch.int32, device="cpu")
+    matched_prefix_lens_i32 = torch.tensor(matched_prefix_arr, dtype=torch.int32, device="cpu")
+
+    sm_scale = 1.0 / math.sqrt(D)
+
+    return dict(
+        query_snd=query_snd,
+        key_snd=key_snd,
+        value_snd=value_snd,
+        segment_offsets_i32=segment_offsets_i32,
+        segment_rules_i32=segment_rules_i32,
+        q_seq_starts_i32=q_seq_starts_i32,
+        matched_prefix_lens_i32=matched_prefix_lens_i32,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_table_tensor=block_table_tensor,
+        num_cache_blocks=num_cache_blocks,
+        sm_scale=sm_scale,
+        H=H,
+        D=D,
+        kv_group=kv_group,
+        block_size=block_size,
+    )
+
+
 test_configs = [
-        # {
-        #     "H": 8,
-        #     "D": 128,
-        #     "seg_lengths": [[1600, 8, 200, 1200]],
-        #     "rules": [0, 1, 2, 2],
-        #     "matched_prefix_arr": [0],
-        # },
-        # {
-        #     "H": 8,
-        #     "D": 128,
-        #     "seg_lengths": [[1600, 8, 200, 1200]],
-        #     "rules": [0, 1, 0, 2],
-        #     "matched_prefix_arr": [0],
-        # },
-        # {
-        #     "H": 8,
-        #     "D": 128,
-        #     "seg_lengths": [[1600, 8, 200, 1200], [1700, 8, 300, 1024]],
-        #     "rules": [0, 1, 2, 2],
-        #     "matched_prefix_arr": [0, 0],
-        # },
-        # {
-        #     "H": 8,
-        #     "D": 128,
-        #     "seg_lengths": [[1800, 8, 100, 1500], [1500, 8, 300, 1200]],
-        #     "rules": [0, 1, 0, 2],
-        #     "matched_prefix_arr": [0, 0],
-        # },
-        # {
-        #     "H": 8,
-        #     "D": 128,
-        #     "seg_lengths": [
-        #         [1600, 8, 200, 1200],
-        #         [1700, 8, 300, 1024],
-        #         [1680, 8, 200, 1280],
-        #         [2000, 8, 700, 2048],
-        #     ],
-        #     "rules": [0, 1, 2, 2],
-        #     "matched_prefix_arr": [0, 0, 0, 0],
-        # },
-        # {
-        #     "H": 8,
-        #     "D": 128,
-        #     "seg_lengths": [
-        #         [3200, 8, 200, 1200],
-        #         [2300, 8, 400, 1800],
-        #         [2080, 8, 200, 1800],
-        #         [1700, 8, 100, 1024],
-        #     ],
-        #     "rules": [0, 1, 0, 2],
-        #     "matched_prefix_arr": [0, 0, 0, 0],
-        # },
-        # {
-        #     "H": 8,
-        #     "D": 128,
-        #     "seg_lengths": [
-        #         [2200, 8, 200, 1024],
-        #         [1700, 8, 100, 1100],
-        #         [2440, 8, 200, 2048],
-        #         [1600, 8, 600, 1900],
-        #         [3300, 8, 200, 1300],
-        #         [1700, 8, 300, 2100],
-        #         [1780, 8, 700, 1200],
-        #         [2048, 8, 500, 1800],
-        #     ],
-        #     "rules": [0, 1, 2, 2],
-        #     "matched_prefix_arr": [0, 0, 0, 0, 0, 0, 0, 0],
-        # },
-        # {
-        #     "H": 8,
-        #     "D": 128,
-        #     "seg_lengths": [
-        #         [2200, 8, 200, 1024],
-        #         [1700, 8, 300, 1100],
-        #         [2440, 8, 200, 2048],
-        #         [1600, 8, 600, 1800],
-        #         [3300, 8, 200, 1300],
-        #         [1700, 8, 300, 2048],
-        #         [1780, 8, 300, 1024],
-        #         [2048, 8, 500, 1800],
-        #     ],
-        #     "rules": [0, 1, 2, 2],
-        #     "matched_prefix_arr": [0, 0, 0, 0, 0, 0, 0, 0],
-        # },
-        # {
-        #     "H": 8,
-        #     "D": 128,
-        #     "seg_lengths": [
-        #         [1600, 200, 1024],
-        #     ],
-        #     "rules": [1, 0, 2],
-        #     "matched_prefix_arr": [0],
-        # },
-        # {
-        #     "H": 8,
-        #     "D": 128,
-        #     "seg_lengths": [
-        #         [1600, 200, 1000],
-        #         [2000, 300, 1100],
-        #     ],
-        #     "rules": [1, 0, 2],
-        #     "matched_prefix_arr": [0, 0],
-        # },
-        # {
-        #     "H": 8,
-        #     "D": 128,
-        #     "seg_lengths": [
-        #         [1600, 200, 1024],
-        #         [1700, 300, 1600],
-        #         [1680, 200, 1200],
-        #         [2000, 700, 2400],
-        #     ],
-        #     "rules": [1, 0, 2],
-        #     "matched_prefix_arr": [0, 0, 0, 0],
-        # },
-        # {
-        #     "H": 8,
-        #     "D": 128,
-        #     "seg_lengths": [
-        #         [2200, 200, 1024],
-        #         [1700, 300, 1100],
-        #         [2440, 200, 2048],
-        #         [1600, 400, 1800],
-        #         [2200, 200, 1300],
-        #         [1700, 300, 2048],
-        #         [180, 300, 1024],
-        #         [2048, 700, 1800],
-        #     ],
-        #     "rules": [1, 0, 2],
-        #     "matched_prefix_arr": [0, 0, 0, 0, 0, 0, 0, 0],
-        # },
+        {
+            "H": 8,
+            "D": 128,
+            "seg_lengths": [[1600, 8, 200, 1200]],
+            "rules": [0, 1, 2, 2],
+            "matched_prefix_arr": [0],
+        },
+        {
+            "H": 8,
+            "D": 128,
+            "seg_lengths": [[1600, 8, 200, 1200]],
+            "rules": [0, 1, 0, 2],
+            "matched_prefix_arr": [0],
+        },
+        {
+            "H": 8,
+            "D": 128,
+            "seg_lengths": [[1600, 8, 200, 1200], [1700, 8, 300, 1024]],
+            "rules": [0, 1, 2, 2],
+            "matched_prefix_arr": [0, 0],
+        },
+        {
+            "H": 8,
+            "D": 128,
+            "seg_lengths": [[1800, 8, 100, 1500], [1500, 8, 300, 1200]],
+            "rules": [0, 1, 0, 2],
+            "matched_prefix_arr": [0, 0],
+        },
+        {
+            "H": 8,
+            "D": 128,
+            "seg_lengths": [
+                [1600, 8, 200, 1200],
+                [1700, 8, 300, 1024],
+                [1680, 8, 200, 1280],
+                [2000, 8, 700, 2048],
+            ],
+            "rules": [0, 1, 2, 2],
+            "matched_prefix_arr": [0, 0, 0, 0],
+        },
+        {
+            "H": 8,
+            "D": 128,
+            "seg_lengths": [
+                [3200, 8, 200, 1200],
+                [2300, 8, 400, 1800],
+                [2080, 8, 200, 1800],
+                [1700, 8, 100, 1024],
+            ],
+            "rules": [0, 1, 0, 2],
+            "matched_prefix_arr": [0, 0, 0, 0],
+        },
+        {
+            "H": 8,
+            "D": 128,
+            "seg_lengths": [
+                [2200, 8, 200, 1024],
+                [1700, 8, 100, 1100],
+                [2440, 8, 200, 2048],
+                [1600, 8, 600, 1900],
+                [3300, 8, 200, 1300],
+                [1700, 8, 300, 2100],
+                [1780, 8, 700, 1200],
+                [2048, 8, 500, 1800],
+            ],
+            "rules": [0, 1, 2, 2],
+            "matched_prefix_arr": [0, 0, 0, 0, 0, 0, 0, 0],
+        },
+        {
+            "H": 8,
+            "D": 128,
+            "seg_lengths": [
+                [2200, 8, 200, 1024],
+                [1700, 8, 300, 1100],
+                [2440, 8, 200, 2048],
+                [1600, 8, 600, 1800],
+                [3300, 8, 200, 1300],
+                [1700, 8, 300, 2048],
+                [1780, 8, 300, 1024],
+                [2048, 8, 500, 1800],
+            ],
+            "rules": [0, 1, 2, 2],
+            "matched_prefix_arr": [0, 0, 0, 0, 0, 0, 0, 0],
+        },
+        {
+            "H": 8,
+            "D": 128,
+            "seg_lengths": [
+                [1600, 200, 1024],
+            ],
+            "rules": [1, 0, 2],
+            "matched_prefix_arr": [0],
+        },
+        {
+            "H": 8,
+            "D": 128,
+            "seg_lengths": [
+                [1600, 200, 1000],
+                [2000, 300, 1100],
+            ],
+            "rules": [1, 0, 2],
+            "matched_prefix_arr": [0, 0],
+        },
+        {
+            "H": 8,
+            "D": 128,
+            "seg_lengths": [
+                [1600, 200, 1024],
+                [1700, 300, 1600],
+                [1680, 200, 1200],
+                [2000, 700, 2400],
+            ],
+            "rules": [1, 0, 2],
+            "matched_prefix_arr": [0, 0, 0, 0],
+        },
+        {
+            "H": 8,
+            "D": 128,
+            "seg_lengths": [
+                [2200, 200, 1024],
+                [1700, 300, 1100],
+                [2440, 200, 2048],
+                [1600, 400, 1800],
+                [2200, 200, 1300],
+                [1700, 300, 2048],
+                [180, 300, 1024],
+                [2048, 700, 1800],
+            ],
+            "rules": [1, 0, 2],
+            "matched_prefix_arr": [0, 0, 0, 0, 0, 0, 0, 0],
+        },
         {
             "H": 8,
             "D": 64,
