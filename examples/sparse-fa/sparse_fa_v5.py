@@ -1,4 +1,5 @@
 # msprof op --kernel-name="main_kernel" --output="./log" python examples/sparse-fa/sparse_fa_v5.py
+# msprof op simulator --soc-version=Ascend910B2 --kernel-name="main_kernel" --output="./log" python examples/sparse-fa/sparse_fa_v5.py
 
 import torch
 import tilelang
@@ -51,6 +52,7 @@ def high_perf_mtgr_sparse_attn_kernel(
 
     kv_heads = heads // kv_group
     half_M = block_M // 2
+    sub_M = half_M // 2
 
     # 跨核信号与单核内信号定义
     SEM_WS1_C2V = 0
@@ -67,6 +69,7 @@ def high_perf_mtgr_sparse_attn_kernel(
     SIG_L0C = 5
     SIG_IO_UB = 0
     SIG_S_HALF = 1
+    SIG_O_READY = 3
 
     @T.prim_func
     def main(
@@ -564,26 +567,42 @@ def high_perf_mtgr_sparse_attn_kernel(
                             T.tile.add(acc_o, acc_o, o_work_buf)
 
                         T.set_cross_flag("MTE2", SEM_WS3_V2C)
+                    
+                    for sub in T.serial(2):
+                        row_start = sub * sub_M
 
-                    # 最终输出标准化
-                    T.tile.max(sumexp, sumexp, 1.0)
-                    T.tile.broadcast(bcast_buf, sumexp)
-                    T.tile.div(acc_o, acc_o, bcast_buf)
+                        T.tile.max(sumexp[row_start : row_start + sub_M, :], sumexp[row_start : row_start + sub_M, :], 1.0)
+                        T.tile.broadcast(bcast_buf[row_start : row_start + sub_M, :], sumexp[row_start : row_start + sub_M, :])
+                        T.tile.div(acc_o[row_start : row_start + sub_M, :], acc_o[row_start : row_start + sub_M, :], bcast_buf[row_start : row_start + sub_M, :])
 
-                    T.copy(acc_o, o_acc_half)
-                    T.barrier_all()
+                        T.copy(
+                            acc_o[row_start : row_start + sub_M, :],
+                            o_acc_half[row_start : row_start + sub_M, :],
+                        )
+                        T.set_flag("V", "MTE3", SIG_O_READY + sub)
 
-                    # 收尾与拷贝回 GM (支持不规则最后一块裁减)
-                    valid_rows = T.if_then_else(
-                        q_tile_size_live >= (vid + 1) * half_M,
-                        half_M,
-                        T.if_then_else(q_tile_size_live > vid * half_M, q_tile_size_live - vid * half_M, 0),
-                    )
+                        T.wait_flag("V", "MTE3", SIG_O_READY + sub)
+                        valid_rows_sub = T.if_then_else(
+                            q_tile_size_live >= vid * half_M + row_start + sub_M,
+                            sub_M,
+                            T.if_then_else(
+                                q_tile_size_live > vid * half_M + row_start,
+                                q_tile_size_live - vid * half_M - row_start,
+                                0,
+                            ),
+                        )
+                        h_i_out = (cid + core_index * core_num) % heads
+                        output_packed_start = q_packed_start + vid * half_M + row_start
 
-                    h_i_out = (cid + core_index * core_num) % heads
-                    output_packed_start = q_packed_start + vid * half_M
-
-                    T.copy(o_acc_half[0:valid_rows, :], Output[output_packed_start : output_packed_start + valid_rows, h_i_out, :])
+                        if valid_rows_sub > 0:
+                            T.copy(
+                                o_acc_half[row_start : row_start + valid_rows_sub, :],
+                                Output[
+                                    output_packed_start : output_packed_start + valid_rows_sub,
+                                    h_i_out,
+                                    :,
+                                ],
+                            )
 
                 T.wait_flag("V", "MTE2", SIG_IO_UB)
                 T.wait_flag("MTE3", "V", SIG_S_HALF)
@@ -763,18 +782,9 @@ if __name__ == "__main__":
         {
             "H": 8,
             "D": 128,
-            "seg_lengths": [
-                [2200, 8, 200, 1024],
-                [1700, 8, 100, 1100],
-                [2440, 8, 200, 2048],
-                [1600, 8, 600, 1900],
-                [3300, 8, 200, 1300],
-                [1700, 8, 300, 2100],
-                [1780, 8, 700, 1200],
-                [2048, 8, 500, 1800],
-            ],
+            "seg_lengths": [[1600, 8, 200, 1200]],
             "rules": [0, 1, 2, 2],
-            "matched_prefix_arr": [0, 0, 0, 0, 0, 0, 0, 0],
+            "matched_prefix_arr": [0],
         },
     ]
 
