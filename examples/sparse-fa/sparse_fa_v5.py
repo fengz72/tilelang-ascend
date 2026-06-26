@@ -646,18 +646,46 @@ def high_perf_mtgr_sparse_attn_kernel(
 # ---------------------------------------------------------------------------
 # Host 端 Wrapper（集成动态长度推导与 Workspace 分配）
 # ---------------------------------------------------------------------------
-def compute_split_points(seg_lengths, block_M):
-    splits = [0]
-    for _, length in enumerate(seg_lengths):
-        seg_start = splits[-1]
-        seg_end = seg_start + length
-        pos = seg_start
-        while pos < seg_end:
-            next_pos = min(pos + block_M, seg_end)
-            if next_pos not in splits:
-                splits.append(next_pos)
-            pos = next_pos
-    return splits
+def compute_split_points_batch(segment_offsets_i32, block_M):
+    B = segment_offsets_i32.size(0)
+    seg_lengths = segment_offsets_i32[:, 1:] - segment_offsets_i32[:, :-1]
+    seg_starts = segment_offsets_i32[:, :-1]
+
+    num_splits_per_seg = torch.clamp((seg_lengths + block_M - 1) // block_M, min=0)
+    max_splits_per_seg = num_splits_per_seg.max().item()
+
+    if max_splits_per_seg == 0:
+        return (
+            torch.zeros((B, 1), dtype=torch.int32, device=segment_offsets_i32.device),
+            torch.zeros(B, dtype=torch.int32, device=segment_offsets_i32.device),
+        )
+
+    k = torch.arange(1, max_splits_per_seg + 1, dtype=torch.int32, device=segment_offsets_i32.device)
+    k_block = (k * block_M).view(1, 1, -1)
+    capped = torch.minimum(k_block, seg_lengths.unsqueeze(-1))
+    split_points_3d = seg_starts.unsqueeze(-1) + capped
+
+    valid = k.view(1, 1, -1) <= num_splits_per_seg.unsqueeze(-1)
+
+    SENTINEL = 0x7FFFFFFF
+    split_points_flat = torch.where(
+        valid, split_points_3d, torch.full_like(split_points_3d, SENTINEL)
+    ).view(B, -1)
+
+    split_points_sorted, _ = split_points_flat.sort(dim=1)
+
+    num_valid = valid.view(B, -1).sum(dim=1)
+    max_num_valid = num_valid.max().item()
+
+    valid_part = split_points_sorted[:, :max_num_valid]
+    valid_part = torch.where(
+        valid_part == SENTINEL, torch.zeros_like(valid_part), valid_part
+    )
+
+    zeros = torch.zeros((B, 1), dtype=torch.int32, device=segment_offsets_i32.device)
+    split_points_i32 = torch.cat([zeros, valid_part], dim=1)
+
+    return split_points_i32, num_valid.to(torch.int32)
 
 
 def high_perf_sparse_attn_wrapper(
@@ -690,32 +718,17 @@ def high_perf_sparse_attn_wrapper(
     assert segment_rules_i32.size(0) == max_segs, \
         f"segment_rules_i32 shape {segment_rules_i32.shape} != [max_segs={max_segs}]"
 
-    seg_lengths_list = []
-    for b in range(B):
-        offsets = segment_offsets_i32[b].cpu().tolist()
-        lengths = [offsets[i + 1] - offsets[i] for i in range(max_segs)]
-        seg_lengths_list.append(lengths)
+    split_points_i32, num_tiles_per_batch = compute_split_points_batch(
+        segment_offsets_i32, block_M
+    )
 
-    max_splits = 0
-    all_split_points = []
+    max_splits = split_points_i32.size(1)
+    total_seq_tiles = num_tiles_per_batch.sum().item()
 
-    for b in range(B):
-        splits = compute_split_points(seg_lengths_list[b], block_M)
-        all_split_points.append(splits)
-        max_splits = max(max_splits, len(splits))
-
-    split_points_padded = []
-    for sp in all_split_points:
-        split_points_padded.append(sp + [0] * (max_splits - len(sp)))
-    split_points_i32 = torch.tensor(split_points_padded, dtype=torch.int32, device=query.device)
-
-    tiles_per_batch = [len(sp) - 1 for sp in all_split_points]
-    total_seq_tiles = sum(tiles_per_batch)
-
-    tiles_prefix_sum_list = [0]
-    for t in tiles_per_batch:
-        tiles_prefix_sum_list.append(tiles_prefix_sum_list[-1] + t)
-    tiles_prefix_sum_i32 = torch.tensor(tiles_prefix_sum_list, dtype=torch.int32, device=query.device)
+    tiles_prefix_sum_i32 = torch.zeros(
+        B + 1, dtype=torch.int32, device=query.device
+    )
+    tiles_prefix_sum_i32[1:] = torch.cumsum(num_tiles_per_batch, dim=0).to(torch.int32)
 
     ws1 = torch.empty((core_num, num_stages, block_M, block_N), dtype=torch.bfloat16, device=query.device)
     ws2 = torch.empty((core_num, num_stages, block_M, block_N), dtype=torch.bfloat16, device=query.device)
