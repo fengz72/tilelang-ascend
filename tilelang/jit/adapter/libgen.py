@@ -76,9 +76,10 @@ class LibraryGenerator:
             command = [
                 "bisheng",
                 "--npu-arch=dav-2201",
-                "-O2",
+                "-O3",
                 "-std=c++17",
                 "-xasc",
+                "--cce-auto-sync=off",
                 f"-I{ASCEND_HOME_PATH}/include",
                 f"-I{ASCEND_HOME_PATH}/include/experiment/msprof",
                 f"-I{ASCEND_HOME_PATH}/include/experiment/runtime",
