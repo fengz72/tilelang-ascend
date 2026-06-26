@@ -67,9 +67,12 @@ def high_perf_mtgr_sparse_attn_kernel(
     SIG_V_L1 = 2
     SIG_L0AB = 3
     SIG_L0C = 5
+    SIG_Q_L1 = 7
+
     SIG_IO_UB = 0
     SIG_S_HALF = 1
     SIG_O_READY = 3
+    SIG_V_S_READY = 5
 
     @T.prim_func
     def main(
@@ -243,7 +246,8 @@ def high_perf_mtgr_sparse_attn_kernel(
 
                     # 载入 Q
                     T.copy(Q[q_packed_start : q_packed_start + q_tile_size_live, h_i, :], q_l1[:, :])
-                    T.barrier_all()
+                    T.set_flag("MTE2", "MTE1", SIG_Q_L1)
+                    T.wait_flag("MTE2", "MTE1", SIG_Q_L1)
                     num_outer = T.ceildiv(valid_k_total, num_stages)
 
                     for k_outer in T.serial(num_outer):
@@ -463,8 +467,11 @@ def high_perf_mtgr_sparse_attn_kernel(
                             valid_k_indices[valid_k_total] = k_i
                             valid_k_total += 1
 
+                    T.pipe_barrier("v")
                     T.tile.fill(acc_o, 0.0)
+                    T.pipe_barrier("v")
                     T.tile.fill(sumexp, 0.0)
+                    T.pipe_barrier("v")
                     T.tile.fill(neg_sm, 2**30)
 
                     num_outer = T.ceildiv(valid_k_total, num_stages)
@@ -483,8 +490,10 @@ def high_perf_mtgr_sparse_attn_kernel(
                             kv_size = split_points[b_i, k_idx + 1] - kv_start
                             seg_start = segment_offsets[b_i, seg_id]
                             seg_end = segment_offsets[b_i, seg_id + 1]
+                            
 
                             # 【核心优化】计算掩盖 (Hiding Computation)：在等 Cube 前利用算力资源提前生成 MASK
+                            T.pipe_barrier("v")
                             T.tile.fill(buf_2d, NEG_INF)
                             for row in T.serial(half_M):
                                 row_abs_pos = q_start + vid * half_M + row
@@ -493,21 +502,27 @@ def high_perf_mtgr_sparse_attn_kernel(
                                     fill_len = T.if_then_else(raw_len < kv_size, raw_len, kv_size)
                                     fill_len = T.if_then_else(fill_len > 0, fill_len, 0)
                                     if fill_len > 0:
+                                        # T.pipe_barrier("v")
                                         T.tile.fill(buf_2d[row, 0:fill_len], 0.0)
                                 elif rule == 1:
                                     raw_len = seg_end - kv_start
                                     fill_len = T.if_then_else(raw_len < kv_size, raw_len, kv_size)
                                     fill_len = T.if_then_else(fill_len > 0, fill_len, 0)
                                     if fill_len > 0:
+                                        # T.pipe_barrier("v")
                                         T.tile.fill(buf_2d[row, 0:fill_len], 0.0)
                                 elif rule == 2:
                                     raw_len = seg_start - kv_start
                                     fill_len = T.if_then_else(raw_len < kv_size, raw_len, kv_size)
                                     fill_len = T.if_then_else(fill_len > 0, fill_len, 0)
                                     if fill_len > 0:
+                                        # T.pipe_barrier("v")
                                         T.tile.fill(buf_2d[row, 0:fill_len], 0.0)
                                     diag_col = row_abs_pos - kv_start
+                                    
                                     if (diag_col >= 0) & (diag_col < kv_size):
+                                        T.set_flag("v", "s", SIG_V_S_READY)
+                                        T.wait_flag("v", "s", SIG_V_S_READY)
                                         buf_2d[row, diag_col] = 0.0
 
                             T.wait_flag("V", "MTE2", SIG_IO_UB)
@@ -518,20 +533,28 @@ def high_perf_mtgr_sparse_attn_kernel(
                             T.set_flag("MTE2", "V", SIG_IO_UB)
 
                             T.wait_flag("MTE2", "V", SIG_IO_UB)
+                            T.pipe_barrier("v")
                             T.copy(io_buf, work_ub)
                             T.set_flag("V", "MTE2", SIG_IO_UB)
 
                             # 施加 Mask 到矩阵 S
+                            T.pipe_barrier("v")
                             T.tile.add(work_ub, work_ub, buf_2d)
-
+                            T.pipe_barrier("v")
                             T.reduce_max(work_ub, neg_sm[cur, :, :], dim=-1)
+                            T.pipe_barrier("v")
                             T.tile.mul(neg_sm[cur, :, :], neg_sm[cur, :, :], -sm_scale)
+                            T.pipe_barrier("v")
                             T.tile.min(neg_sm[cur, :, :], neg_sm[cur, :, :], neg_sm[prv, :, :])
+                            T.pipe_barrier("v")
                             T.tile.broadcast(buf_2d, neg_sm[cur, :, :])
+                            T.pipe_barrier("v")
                             T.tile.axpy(buf_2d, work_ub, sm_scale)
+                            T.pipe_barrier("v")
                             T.tile.exp(work_ub, buf_2d)
 
                             T.wait_flag("MTE3", "V", SIG_S_HALF)
+                            T.pipe_barrier("v")
                             T.copy(work_ub, acc_s_half)
                             T.set_flag("V", "MTE3", SIG_S_HALF)
 
@@ -542,16 +565,23 @@ def high_perf_mtgr_sparse_attn_kernel(
                             if (i + 1) % cross_interval == 0 or i == batch_iters - 1:
                                 T.set_cross_flag("MTE3", SEM_WS2_V2C)
 
+                            T.pipe_barrier("v")
                             T.reduce_sum(work_ub, sumexp_is[i, :, :], dim=-1)
+                            T.pipe_barrier("v")
                             T.tile.sub(r_factors[i, :, :], neg_sm[cur, :, :], neg_sm[prv, :, :])
                         T.set_cross_flag("MTE2", SEM_WS1_V2C)
 
                         # --- O 累加 Batch ---
                         for i in T.serial(batch_iters):
+                            T.pipe_barrier("v")
                             T.tile.exp(r_factors[i, :, :], r_factors[i, :, :])
+                            T.pipe_barrier("v")
                             T.tile.mul(sumexp, sumexp, r_factors[i, :, :])
+                            T.pipe_barrier("v")
                             T.tile.add(sumexp, sumexp, sumexp_is[i, :, :])
+                            T.pipe_barrier("v")
                             T.tile.broadcast(bcast_buf, r_factors[i, :, :])
+                            T.pipe_barrier("v")
                             T.tile.mul(acc_o, acc_o, bcast_buf)
 
                             T.wait_flag("V", "MTE2", SIG_IO_UB)
@@ -561,20 +591,23 @@ def high_perf_mtgr_sparse_attn_kernel(
                             T.set_flag("MTE2", "V", SIG_IO_UB)
 
                             T.wait_flag("MTE2", "V", SIG_IO_UB)
+                            T.pipe_barrier("v")
                             T.copy(o_io_buf, o_work_buf)
                             T.set_flag("V", "MTE2", SIG_IO_UB)
-
+                            T.pipe_barrier("v")
                             T.tile.add(acc_o, acc_o, o_work_buf)
 
                         T.set_cross_flag("MTE2", SEM_WS3_V2C)
                     
                     for sub in T.serial(2):
                         row_start = sub * sub_M
-
+                        T.pipe_barrier("v")
                         T.tile.max(sumexp[row_start : row_start + sub_M, :], sumexp[row_start : row_start + sub_M, :], 1.0)
+                        T.pipe_barrier("v")
                         T.tile.broadcast(bcast_buf[row_start : row_start + sub_M, :], sumexp[row_start : row_start + sub_M, :])
+                        T.pipe_barrier("v")
                         T.tile.div(acc_o[row_start : row_start + sub_M, :], acc_o[row_start : row_start + sub_M, :], bcast_buf[row_start : row_start + sub_M, :])
-
+                        T.pipe_barrier("v")
                         T.copy(
                             acc_o[row_start : row_start + sub_M, :],
                             o_acc_half[row_start : row_start + sub_M, :],

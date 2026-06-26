@@ -160,7 +160,7 @@ def main():
     parser.add_argument("--rtol", type=float, default=1e-2)
     parser.add_argument("--atol", type=float, default=1e-2)
     parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--repeat", type=int, default=20)
+    parser.add_argument("--repeat", type=int, default=10)
     parser.add_argument("--msprof-log", type=str, default="./log", help="msprof output directory")
     parser.add_argument("--_msprof-worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
