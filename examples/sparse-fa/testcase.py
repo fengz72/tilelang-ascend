@@ -1,4 +1,5 @@
 import math
+import random
 import torch
 
 
@@ -259,6 +260,64 @@ _base_patterns = [
         "matched_prefix_arr": [0, 0, 0, 0, 0, 0, 0, 0],
     },
 ]
+
+
+def _generate_multi_seg_patterns():
+    patterns = []
+    rng = random.Random(42)
+
+    prefix_pool = [1600, 2000, 2400, 3200]
+    suffix_pool = [1024, 1200, 1800, 2048]
+
+    cases = [
+        (64,   16,  4), (64,   16,  2), (64,   16,  1),
+        (128,  16,  2), (128,  16,  1),
+        (256,  16,  1),
+        (512,  16,  1),
+        (1024, 16,  1),
+        (64,   32,  2),
+        (64,   64,  2), (64,   64,  1),
+        (64,   128, 1),
+        (64,   256, 1),
+        (64,   512, 1),
+        (128,  32,  2), (128,  32,  1),
+        (128,  64,  1),
+        (128,  128, 1),
+        (128,  256, 1),
+        (128,  512, 1),
+        (256,  32,  1),
+        (256,  64,  1),
+        (256,  128, 1),
+        (256,  256, 1),
+        (256,  512, 1),
+        (512,  32,  1),
+        (512,  64,  1),
+        (512,  128, 1),
+        (512,  256, 1),
+        (512,  512, 1),
+        (1024, 32,  1),
+        (1024, 64,  1),
+        (1024, 128, 1),
+        (1024, 256, 1),
+        (1024, 512, 1),
+    ]
+
+    for num_seg, seg_len, B in cases:
+        prefix = rng.choice(prefix_pool)
+        suffix = rng.choice(suffix_pool)
+        sl = [prefix, 8] + [seg_len] * num_seg + [suffix]
+        seg_lengths = [sl] * B
+        rules = [0, 1] + [0] * num_seg + [2]
+        patterns.append({
+            "seg_lengths": seg_lengths,
+            "rules": rules,
+            "matched_prefix_arr": [0] * B,
+        })
+
+    return patterns
+
+
+_base_patterns.extend(_generate_multi_seg_patterns())
 
 _D_values = [128, 64, 32]
 
