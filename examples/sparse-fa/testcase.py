@@ -307,7 +307,7 @@ def _generate_multi_seg_patterns():
         suffix = rng.choice(suffix_pool)
         sl = [prefix, 8] + [seg_len] * num_seg + [suffix]
         seg_lengths = [sl] * B
-        rules = [0, 1] + [0] * num_seg + [2]
+        rules = [0, 1] + [2] * num_seg + [2]
         patterns.append({
             "seg_lengths": seg_lengths,
             "rules": rules,
@@ -347,7 +347,7 @@ def _generate_constraint_patterns():
         suffix = rng.choice(suffix_pool)
         sl = [prefix, 8] + [seg_len] * num_seg + [suffix]
         seg_lengths = [sl] * B
-        rules = [0, 1] + [0] * num_seg + [2]
+        rules = [0, 1] + [2] * num_seg + [2]
         patterns.append({
             "seg_lengths": seg_lengths,
             "rules": rules,
@@ -387,7 +387,7 @@ def _generate_constraint_patterns():
         suffix = rng.choice(suffix_pool)
         sl = [prefix, 8] + [seg_len] * num_seg + [suffix]
         seg_lengths = [sl] * B
-        rules = [0, 1] + [0] * num_seg + [2]
+        rules = [0, 1] + [2] * num_seg + [2]
         patterns.append({
             "seg_lengths": seg_lengths,
             "rules": rules,
