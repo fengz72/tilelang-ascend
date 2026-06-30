@@ -357,48 +357,7 @@ def _generate_constraint_patterns():
     return patterns
 
 
-def _generate_constraint_patterns():
-    patterns = []
-    rng = random.Random(123)
-
-    prefix_pool = [1600, 2000, 2400, 3200]
-    suffix_pool = [1024, 1200, 1800, 2048]
-
-    cases = [
-        (32, 5,  4), (32, 5,  2), (32, 5,  1),
-        (32, 7,  2), (32, 7,  1),
-        (32, 10, 2), (32, 10, 1),
-        (32, 12, 1),
-        (32, 15, 1),
-        (50, 5,  2), (50, 5,  1),
-        (50, 7,  1),
-        (50, 10, 1),
-        (50, 12, 1),
-        (50, 15, 1),
-        (64, 5,  1),
-        (64, 7,  1),
-        (64, 10, 1),
-        (64, 12, 1),
-        (64, 15, 1),
-    ]
-
-    for num_seg, seg_len, B in cases:
-        prefix = rng.choice(prefix_pool)
-        suffix = rng.choice(suffix_pool)
-        sl = [prefix, 8] + [seg_len] * num_seg + [suffix]
-        seg_lengths = [sl] * B
-        rules = [0, 1] + [2] * num_seg + [2]
-        patterns.append({
-            "seg_lengths": seg_lengths,
-            "rules": rules,
-            "matched_prefix_arr": [0] * B,
-        })
-
-    return patterns
-
-
 _base_patterns.extend(_generate_multi_seg_patterns())
-_base_patterns.extend(_generate_constraint_patterns())
 _base_patterns.extend(_generate_constraint_patterns())
 
 _D_values = [128, 64, 32]
