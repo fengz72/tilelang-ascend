@@ -43,7 +43,9 @@ def run_kernel(data, config):
 
 
 def run_accuracy(data, config, rtol, atol):
+    torch.npu.synchronize()
     output_snd = run_kernel(data, config)
+    torch.npu.synchronize()
 
     ref_output = golden_attention_float64(
         data["query_snd"],
@@ -61,9 +63,9 @@ def run_accuracy(data, config, rtol, atol):
     )
 
     torch.npu.synchronize()
-    max_diff = (ref_output.npu().float() - output_snd.float()).abs().max().item()
+    max_diff = (ref_output.cpu().float() - output_snd.cpu().float()).abs().max().item()
     try:
-        torch.testing.assert_close(ref_output.npu(), output_snd, rtol=rtol, atol=atol)
+        torch.testing.assert_close(ref_output.cpu(), output_snd.cpu(), rtol=rtol, atol=atol)
         print(f"  accuracy: PASSED (max_diff={max_diff:.6f})")
         return True
     except AssertionError as e:
@@ -187,6 +189,7 @@ def main():
         config = test_configs[idx]
         label = case_label(idx, config)
         print(label)
+        torch.npu.synchronize()
         data = prepare_data(config)
 
         if args.mode in ("accuracy", "all"):
