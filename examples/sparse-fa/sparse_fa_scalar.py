@@ -8,9 +8,6 @@ from tilelang.intrinsics import make_zn_layout, make_nz_layout
 from golden import golden_attention_float64
 from testcase import prepare_data
 
-torch.manual_seed(41)
-tilelang.disable_cache()
-tilelang.cache.clear_cache()
 
 # ---------------------------------------------------------------------------
 # 常量与优化 Pass 配置
@@ -130,6 +127,10 @@ def high_perf_mtgr_sparse_attn_kernel(
             o_work_buf = T.alloc_ub([half_M, dim], accum_dtype)
             o_acc_half = T.alloc_ub([half_M, dim], dtype)
 
+            row_rule_buf = T.alloc_ub([half_M], "int32")
+            row_seg_start_buf = T.alloc_ub([half_M], "int32")
+            row_seg_end_buf = T.alloc_ub([half_M], "int32")
+
             T.annotate_address(
                 {
                     l0a_s: 0,
@@ -152,32 +153,33 @@ def high_perf_mtgr_sparse_attn_kernel(
                     o_work_buf: half_M * dim * 4 + num_stages * half_M * 4 * 2 + half_M * 12 + half_M * block_N * 4,
                     buf_2d: half_M * dim * 4 + num_stages * half_M * 4 * 2 + half_M * 12 + half_M * block_N * 8,
                     bcast_buf: half_M * dim * 4 + num_stages * half_M * 4 * 2 + half_M * 12 + half_M * block_N * 8,
+                    row_rule_buf: half_M * dim * 4 + num_stages * half_M * 4 * 2 + half_M * 12 + half_M * block_N * 8 + half_M * block_N * 4,
+                    row_seg_start_buf: half_M * dim * 4 + num_stages * half_M * 4 * 2 + half_M * 12 + half_M * block_N * 8 + half_M * block_N * 4 + half_M * 4,
+                    row_seg_end_buf: half_M * dim * 4 + num_stages * half_M * 4 * 2 + half_M * 12 + half_M * block_N * 8 + half_M * block_N * 4 + half_M * 4 * 2,
                 }
             )
 
             b_i = T.alloc_var("int32", init=0)
-            seg_id = T.alloc_var("int32", init=0)
-            next_seg_first_tile = T.alloc_var("int32", init=0)
-            valid_k_total = T.alloc_var("int32", init=0)
-            scan_count = T.alloc_var("int32", init=0)
-            scan_k_idx = T.alloc_var("int32", init=-1)
             s_local = T.alloc_var("int32", init=0)
-            cum_sp = T.alloc_var("int32", init=0)
-            sp_val_start = T.alloc_var("int32", init=0)
-            sp_val_end = T.alloc_var("int32", init=0)
             kv_start = T.alloc_var("int32", init=0)
-            kv_end_found = T.alloc_var("int32", init=0)
-            tiles_this_batch = T.alloc_var("int32", init=0)
-            k_scan_counter = T.alloc_var("int32", init=0)
+            kv_size = T.alloc_var("int32", init=0)
             cum_tiles = T.alloc_var("int32", init=0)
             num_tiles_b = T.alloc_var("int32", init=0)
             total_seq_tiles = T.alloc_var("int32", init=0)
+            total_seq_len_b = T.alloc_var("int32", init=0)
+            k_upper_bound = T.alloc_var("int32", init=0)
+            num_k_tiles = T.alloc_var("int32", init=0)
+            seg_id = T.alloc_var("int32", init=0)
+            last_seg_start = T.alloc_var("int32", init=0)
+            gap_k_start = T.alloc_var("int32", init=0)
+            gap_k_end = T.alloc_var("int32", init=0)
+            gap_size = T.alloc_var("int32", init=0)
+            num_effective_k = T.alloc_var("int32", init=0)
 
             total_seq_tiles = 0
             for _b in T.serial(batch):
-                for _seg in T.serial(max_segs):
-                    _seg_len = segment_offsets[_b, _seg + 1] - segment_offsets[_b, _seg]
-                    total_seq_tiles = total_seq_tiles + T.ceildiv(_seg_len, block_M)
+                _total_seq_len = segment_offsets[_b, max_segs]
+                total_seq_tiles = total_seq_tiles + T.ceildiv(_total_seq_len, block_M)
             total_tasks = total_seq_tiles * heads
             my_iters = T.if_then_else(
                 cid < total_tasks,
@@ -207,104 +209,53 @@ def high_perf_mtgr_sparse_attn_kernel(
                     cum_tiles = 0
                     b_i = 0
                     s_local = 0
-                    tiles_this_batch = 0
                     for _b in T.serial(batch):
-                        num_tiles_b = 0
-                        for _seg in T.serial(max_segs):
-                            _seg_len = segment_offsets[_b, _seg + 1] - segment_offsets[_b, _seg]
-                            num_tiles_b = num_tiles_b + T.ceildiv(_seg_len, block_M)
+                        _total_seq_len = segment_offsets[_b, max_segs]
+                        num_tiles_b = T.ceildiv(_total_seq_len, block_M)
                         _is_this = (tile_id >= cum_tiles) & (tile_id < cum_tiles + num_tiles_b)
                         b_i = T.if_then_else(_is_this, _b, b_i)
                         s_local = T.if_then_else(_is_this, tile_id - cum_tiles, s_local)
-                        tiles_this_batch = T.if_then_else(_is_this, num_tiles_b, tiles_this_batch)
                         cum_tiles = cum_tiles + num_tiles_b
-                    
-                    sp_val_start = 0
-                    sp_val_end = 0
-                    cum_sp = 0
-                    for _seg in T.serial(max_segs):
-                        _seg_start = segment_offsets[b_i, _seg]
-                        _seg_len = segment_offsets[b_i, _seg + 1] - segment_offsets[b_i, _seg]
-                        _num_sp = T.ceildiv(_seg_len, block_M)
-                        # q_start
-                        _lk_s = s_local - cum_sp
-                        _in_seg_s = (_lk_s >= 1) & (_lk_s <= _num_sp)
-                        _off_s = T.if_then_else(_lk_s * block_M < _seg_len, _lk_s * block_M, _seg_len)
-                        sp_val_start = T.if_then_else(_in_seg_s, _seg_start + _off_s, sp_val_start)
-                        # q_end
-                        _lk_e = (s_local + 1) - cum_sp
-                        _in_seg_e = (_lk_e >= 1) & (_lk_e <= _num_sp)
-                        _off_e = T.if_then_else(_lk_e * block_M < _seg_len, _lk_e * block_M, _seg_len)
-                        sp_val_end = T.if_then_else(_in_seg_e, _seg_start + _off_e, sp_val_end)
-                        
-                        cum_sp = cum_sp + _num_sp
-                    q_start = sp_val_start
-                    q_end = sp_val_end
-                    q_tile_size = q_end - q_start
 
-                    seg_id = 0
-                    for _seg in T.serial(max_segs - 1):
-                        seg_id = T.if_then_else(q_start >= segment_offsets[b_i, _seg + 1], _seg + 1, seg_id)
+                    total_seq_len_b = segment_offsets[b_i, max_segs]
+                    q_start = s_local * block_M
+                    q_end = T.if_then_else(q_start + block_M < total_seq_len_b, q_start + block_M, total_seq_len_b)
 
-                    rule = segment_rules[seg_id]
                     prefix_len_b = prefix_lens[b_i]
                     q_start_live = T.if_then_else(q_start >= prefix_len_b, q_start, prefix_len_b)
                     q_tile_size_live = q_end - q_start_live
                     q_tile_size_live = T.if_then_else(q_tile_size_live > 0, q_tile_size_live, 0)
                     q_packed_start = q_seq_starts[b_i] + q_start_live - prefix_len_b
-                    seg_end_offset = segment_offsets[b_i, seg_id + 1]
 
-                    next_seg_first_tile = tiles_this_batch
-                    k_scan_counter = 0
+                    k_upper_bound = q_end
                     for _seg in T.serial(max_segs):
                         _seg_start = segment_offsets[b_i, _seg]
-                        _seg_len = segment_offsets[b_i, _seg + 1] - segment_offsets[b_i, _seg]
-                        _num_sp = T.ceildiv(_seg_len, block_M)
-                        for _lk in T.serial(_num_sp):
-                            _tile_start = _seg_start + _lk * block_M
-                            next_seg_first_tile = T.if_then_else(
-                                (k_scan_counter > s_local)
-                                & (k_scan_counter <= tiles_this_batch)
-                                & (_tile_start >= seg_end_offset)
-                                & (k_scan_counter < next_seg_first_tile),
-                                k_scan_counter,
-                                next_seg_first_tile,
-                            )
-                            k_scan_counter = k_scan_counter + 1
-                    kv_iter_end = T.if_then_else(rule == 1, next_seg_first_tile, s_local + 1)
+                        _seg_end = segment_offsets[b_i, _seg + 1]
+                        _rule = segment_rules[_seg]
+                        _overlaps = (_seg_end > q_start) & (_seg_start < q_end)
+                        k_upper_bound = T.if_then_else(
+                            _overlaps & (_rule == 1) & (_seg_end > k_upper_bound),
+                            _seg_end, k_upper_bound
+                        )
+                    num_k_tiles = T.ceildiv(k_upper_bound, block_M)
 
-                    seg_start = segment_offsets[b_i, seg_id]
-                    seg_end = segment_offsets[b_i, seg_id + 1]
-                    max_row_pos = q_start + q_tile_size - 1
-                    valid_k_total = 0
-                    k_scan_counter = 0
-                    for _seg in T.serial(max_segs):
-                        _seg_start = segment_offsets[b_i, _seg]
-                        _seg_len = segment_offsets[b_i, _seg + 1] - segment_offsets[b_i, _seg]
-                        _seg_len = T.if_then_else(_seg_len > 0, _seg_len, 0)
-                        _num_sp = T.ceildiv(_seg_len, block_M)
-                        for _lk in T.serial(_num_sp):
-                            _kv_start_k = _seg_start + _lk * block_M
-                            _kv_end_k = _seg_start + T.if_then_else((_lk + 1) * block_M < _seg_len, (_lk + 1) * block_M, _seg_len)
-                            _in_range = k_scan_counter < kv_iter_end
-                            _process_cond = (
-                                ((rule == 0) & (_kv_start_k <= max_row_pos))
-                                | ((rule == 1) & (_kv_start_k < seg_end))
-                                | ((rule == 2) & ((_kv_start_k < seg_start) | ((_kv_start_k < q_end) & (_kv_end_k > q_start))))
-                            )
-                            if _in_range & _process_cond:
-                                valid_k_total += 1
-                            k_scan_counter = k_scan_counter + 1
+                    last_seg_start = segment_offsets[b_i, max_segs - 1]
+                    gap_k_start = T.ceildiv(last_seg_start, block_M)
+                    gap_k_end = q_start // block_M
+                    gap_size = T.if_then_else(
+                        (q_start >= last_seg_start) & (gap_k_end > gap_k_start),
+                        gap_k_end - gap_k_start, 0)
+                    num_effective_k = num_k_tiles - gap_size
 
                     # 载入 Q
                     T.copy(Q[q_packed_start : q_packed_start + q_tile_size_live, h_i, :], q_l1[:, :])
-                    # T.set_flag("MTE2", "MTE1", SIG_Q_L1)
-                    # T.wait_flag("MTE2", "MTE1", SIG_Q_L1)
-                    T.barrier_all()
-                    num_outer = T.ceildiv(valid_k_total, num_stages)
+                    T.set_flag("MTE2", "MTE1", SIG_Q_L1)
+                    T.wait_flag("MTE2", "MTE1", SIG_Q_L1)
+                    # T.barrier_all()
+                    num_outer = T.ceildiv(num_effective_k, num_stages)
 
                     for k_outer in T.serial(num_outer):
-                        _remaining = valid_k_total - k_outer * num_stages
+                        _remaining = num_effective_k - k_outer * num_stages
                         batch_iters = T.if_then_else(_remaining < num_stages, _remaining, num_stages)
 
                         # ---------------------------------
@@ -313,34 +264,14 @@ def high_perf_mtgr_sparse_attn_kernel(
                         T.wait_cross_flag(SEM_WS1_V2C)
                         for i in T.serial(batch_iters):
                             side = i % 2
-                            scan_count = 0
-                            scan_k_idx = -1
-                            kv_start = 0
-                            kv_end_found = 0
-                            target = k_outer * num_stages + i
-                            k_scan_counter = 0
-                            for _seg in T.serial(max_segs):
-                                _seg_start = segment_offsets[b_i, _seg]
-                                _seg_len = segment_offsets[b_i, _seg + 1] - segment_offsets[b_i, _seg]
-                                _seg_len = T.if_then_else(_seg_len > 0, _seg_len, 0)
-                                _num_sp = T.ceildiv(_seg_len, block_M)
-                                for _lk in T.serial(_num_sp):
-                                    _kv_s = _seg_start + _lk * block_M
-                                    _kv_e = _seg_start + T.if_then_else((_lk + 1) * block_M < _seg_len, (_lk + 1) * block_M, _seg_len)
-                                    _in_range = k_scan_counter < kv_iter_end
-                                    _cond = (
-                                        ((rule == 0) & (_kv_s <= max_row_pos))
-                                        | ((rule == 1) & (_kv_s < seg_end))
-                                        | ((rule == 2) & ((_kv_s < seg_start) | ((_kv_s < q_end) & (_kv_e > q_start))))
-                                    )
-                                    _is_target = _in_range & _cond & (scan_count == target)
-                                    scan_k_idx = T.if_then_else(_is_target, k_scan_counter, scan_k_idx)
-                                    kv_start = T.if_then_else(_is_target, _kv_s, kv_start)
-                                    kv_end_found = T.if_then_else(_is_target, _kv_e, kv_end_found)
-                                    scan_count = T.if_then_else(_in_range & _cond, scan_count + 1, scan_count)
-                                    k_scan_counter = k_scan_counter + 1
-                            kv_size = kv_end_found - kv_start
-                            prefix_len_b = prefix_lens[b_i]
+                            compact_k_idx = k_outer * num_stages + i
+                            k_idx = T.if_then_else(
+                                (q_start >= last_seg_start) & (compact_k_idx >= gap_k_start) & (gap_size > 0),
+                                compact_k_idx + gap_size,
+                                compact_k_idx
+                            )
+                            kv_start = k_idx * block_M
+                            kv_size = T.if_then_else(kv_start + block_M < k_upper_bound, block_M, k_upper_bound - kv_start)
 
                             T.wait_flag("MTE1", "MTE2", SIG_K_L1)
                             if kv_start < prefix_len_b:
@@ -387,34 +318,14 @@ def high_perf_mtgr_sparse_attn_kernel(
                         T.wait_cross_flag(SEM_WS3_V2C)
                         for i in T.serial(batch_iters):
                             side = i % 2
-                            scan_count = 0
-                            scan_k_idx = -1
-                            kv_start = 0
-                            kv_end_found = 0
-                            target = k_outer * num_stages + i
-                            k_scan_counter = 0
-                            for _seg in T.serial(max_segs):
-                                _seg_start = segment_offsets[b_i, _seg]
-                                _seg_len = segment_offsets[b_i, _seg + 1] - segment_offsets[b_i, _seg]
-                                _seg_len = T.if_then_else(_seg_len > 0, _seg_len, 0)
-                                _num_sp = T.ceildiv(_seg_len, block_M)
-                                for _lk in T.serial(_num_sp):
-                                    _kv_s = _seg_start + _lk * block_M
-                                    _kv_e = _seg_start + T.if_then_else((_lk + 1) * block_M < _seg_len, (_lk + 1) * block_M, _seg_len)
-                                    _in_range = k_scan_counter < kv_iter_end
-                                    _cond = (
-                                        ((rule == 0) & (_kv_s <= max_row_pos))
-                                        | ((rule == 1) & (_kv_s < seg_end))
-                                        | ((rule == 2) & ((_kv_s < seg_start) | ((_kv_s < q_end) & (_kv_e > q_start))))
-                                    )
-                                    _is_target = _in_range & _cond & (scan_count == target)
-                                    scan_k_idx = T.if_then_else(_is_target, k_scan_counter, scan_k_idx)
-                                    kv_start = T.if_then_else(_is_target, _kv_s, kv_start)
-                                    kv_end_found = T.if_then_else(_is_target, _kv_e, kv_end_found)
-                                    scan_count = T.if_then_else(_in_range & _cond, scan_count + 1, scan_count)
-                                    k_scan_counter = k_scan_counter + 1
-                            kv_size = kv_end_found - kv_start
-                            prefix_len_b = prefix_lens[b_i]
+                            compact_k_idx = k_outer * num_stages + i
+                            k_idx = T.if_then_else(
+                                (q_start >= last_seg_start) & (compact_k_idx >= gap_k_start) & (gap_size > 0),
+                                compact_k_idx + gap_size,
+                                compact_k_idx
+                            )
+                            kv_start = k_idx * block_M
+                            kv_size = T.if_then_else(kv_start + block_M < k_upper_bound, block_M, k_upper_bound - kv_start)
 
                             T.wait_flag("MTE1", "MTE2", SIG_V_L1)
                             if kv_start < prefix_len_b:
@@ -493,101 +404,59 @@ def high_perf_mtgr_sparse_attn_kernel(
                     h_i = pid % heads
                     h_kv = h_i // kv_group
 
-                    # 重新解析位置（必须与 Scope C 完全对齐）
                     cum_tiles = 0
                     b_i = 0
                     s_local = 0
-                    tiles_this_batch = 0
                     for _b in T.serial(batch):
-                        num_tiles_b = 0
-                        for _seg in T.serial(max_segs):
-                            _seg_len = segment_offsets[_b, _seg + 1] - segment_offsets[_b, _seg]
-                            _seg_len = T.if_then_else(_seg_len > 0, _seg_len, 0)
-                            num_tiles_b = num_tiles_b + T.ceildiv(_seg_len, block_M)
+                        _total_seq_len = segment_offsets[_b, max_segs]
+                        num_tiles_b = T.ceildiv(_total_seq_len, block_M)
                         _is_this = (tile_id >= cum_tiles) & (tile_id < cum_tiles + num_tiles_b)
                         b_i = T.if_then_else(_is_this, _b, b_i)
                         s_local = T.if_then_else(_is_this, tile_id - cum_tiles, s_local)
-                        tiles_this_batch = T.if_then_else(_is_this, num_tiles_b, tiles_this_batch)
                         cum_tiles = cum_tiles + num_tiles_b
 
-                    sp_val_start = 0
-                    sp_val_end = 0
-                    cum_sp = 0
-                    for _seg in T.serial(max_segs):
-                        _seg_start = segment_offsets[b_i, _seg]
-                        _seg_len = segment_offsets[b_i, _seg + 1] - segment_offsets[b_i, _seg]
-                        _seg_len = T.if_then_else(_seg_len > 0, _seg_len, 0)
-                        _num_sp = T.ceildiv(_seg_len, block_M)
+                    total_seq_len_b = segment_offsets[b_i, max_segs]
+                    q_start = s_local * block_M
+                    q_end = T.if_then_else(q_start + block_M < total_seq_len_b, q_start + block_M, total_seq_len_b)
 
-                        _lk_s = s_local - cum_sp
-                        _in_seg_s = (_lk_s >= 1) & (_lk_s <= _num_sp)
-                        _off_s = T.if_then_else(_lk_s * block_M < _seg_len, _lk_s * block_M, _seg_len)
-                        sp_val_start = T.if_then_else(_in_seg_s, _seg_start + _off_s, sp_val_start)
-                        
-                        _lk_e = (s_local + 1) - cum_sp
-                        _in_seg_e = (_lk_e >= 1) & (_lk_e <= _num_sp)
-                        _off_e = T.if_then_else(_lk_e * block_M < _seg_len, _lk_e * block_M, _seg_len)
-                        sp_val_end = T.if_then_else(_in_seg_e, _seg_start + _off_e, sp_val_end)
-                        
-                        cum_sp = cum_sp + _num_sp
-                    q_start = sp_val_start
-                    q_end = sp_val_end
-                    q_tile_size = q_end - q_start
-
-                    seg_id = 0
-                    for _seg in T.serial(max_segs - 1):
-                        seg_id = T.if_then_else(q_start >= segment_offsets[b_i, _seg + 1], _seg + 1, seg_id)
-
-                    rule = segment_rules[seg_id]
                     prefix_len_b = prefix_lens[b_i]
                     q_start_live = T.if_then_else(q_start >= prefix_len_b, q_start, prefix_len_b)
                     q_tile_size_live = q_end - q_start_live
                     q_tile_size_live = T.if_then_else(q_tile_size_live > 0, q_tile_size_live, 0)
                     q_packed_start = q_seq_starts[b_i] + q_start_live - prefix_len_b
-                    seg_end_offset = segment_offsets[b_i, seg_id + 1]
 
-                    next_seg_first_tile = tiles_this_batch
-                    k_scan_counter = 0
+                    k_upper_bound = q_end
                     for _seg in T.serial(max_segs):
                         _seg_start = segment_offsets[b_i, _seg]
-                        _seg_len = segment_offsets[b_i, _seg + 1] - segment_offsets[b_i, _seg]
-                        _seg_len = T.if_then_else(_seg_len > 0, _seg_len, 0)
-                        _num_sp = T.ceildiv(_seg_len, block_M)
-                        for _lk in T.serial(_num_sp):
-                            _tile_start = _seg_start + _lk * block_M
-                            next_seg_first_tile = T.if_then_else(
-                                (k_scan_counter > s_local)
-                                & (k_scan_counter <= tiles_this_batch)
-                                & (_tile_start >= seg_end_offset)
-                                & (k_scan_counter < next_seg_first_tile),
-                                k_scan_counter,
-                                next_seg_first_tile,
-                            )
-                            k_scan_counter = k_scan_counter + 1
-                    kv_iter_end = T.if_then_else(rule == 1, next_seg_first_tile, s_local + 1)
+                        _seg_end = segment_offsets[b_i, _seg + 1]
+                        _rule = segment_rules[_seg]
+                        _overlaps = (_seg_end > q_start) & (_seg_start < q_end)
+                        k_upper_bound = T.if_then_else(
+                            _overlaps & (_rule == 1) & (_seg_end > k_upper_bound),
+                            _seg_end, k_upper_bound
+                        )
+                    num_k_tiles = T.ceildiv(k_upper_bound, block_M)
 
-                    seg_start = segment_offsets[b_i, seg_id]
-                    seg_end = segment_offsets[b_i, seg_id + 1]
-                    max_row_pos = q_start + q_tile_size - 1
-                    valid_k_total = 0
-                    k_scan_counter = 0
-                    for _seg in T.serial(max_segs):
-                        _seg_start = segment_offsets[b_i, _seg]
-                        _seg_len = segment_offsets[b_i, _seg + 1] - segment_offsets[b_i, _seg]
-                        _seg_len = T.if_then_else(_seg_len > 0, _seg_len, 0)
-                        _num_sp = T.ceildiv(_seg_len, block_M)
-                        for _lk in T.serial(_num_sp):
-                            _kv_start_k = _seg_start + _lk * block_M
-                            _kv_end_k = _seg_start + T.if_then_else((_lk + 1) * block_M < _seg_len, (_lk + 1) * block_M, _seg_len)
-                            _in_range = k_scan_counter < kv_iter_end
-                            _process_cond = (
-                                ((rule == 0) & (_kv_start_k <= max_row_pos))
-                                | ((rule == 1) & (_kv_start_k < seg_end))
-                                | ((rule == 2) & ((_kv_start_k < seg_start) | ((_kv_start_k < q_end) & (_kv_end_k > q_start))))
+                    last_seg_start = segment_offsets[b_i, max_segs - 1]
+                    gap_k_start = T.ceildiv(last_seg_start, block_M)
+                    gap_k_end = q_start // block_M
+                    gap_size = T.if_then_else(
+                        (q_start >= last_seg_start) & (gap_k_end > gap_k_start),
+                        gap_k_end - gap_k_start, 0)
+                    num_effective_k = num_k_tiles - gap_size
+
+                    for row in T.serial(half_M):
+                        row_abs_pos = q_start + vid * half_M + row
+
+                        seg_id = 0
+                        for _seg in T.serial(max_segs):
+                            seg_id = T.if_then_else(
+                                (_seg < max_segs - 1) & (row_abs_pos >= segment_offsets[b_i, _seg + 1]),
+                                _seg + 1, seg_id
                             )
-                            if _in_range & _process_cond:
-                                valid_k_total += 1
-                            k_scan_counter = k_scan_counter + 1
+                        row_rule_buf[row] = segment_rules[seg_id]
+                        row_seg_start_buf[row] = segment_offsets[b_i, seg_id]
+                        row_seg_end_buf[row] = segment_offsets[b_i, seg_id + 1]
 
                     T.pipe_barrier("v")
                     T.tile.fill(acc_o, 0.0)
@@ -596,9 +465,9 @@ def high_perf_mtgr_sparse_attn_kernel(
                     T.pipe_barrier("v")
                     T.tile.fill(neg_sm, 2**30)
 
-                    num_outer = T.ceildiv(valid_k_total, num_stages)
+                    num_outer = T.ceildiv(num_effective_k, num_stages)
                     for k_outer in T.serial(num_outer):
-                        _remaining = valid_k_total - k_outer * num_stages
+                        _remaining = num_effective_k - k_outer * num_stages
                         batch_iters = T.if_then_else(_remaining < num_stages, _remaining, num_stages)
 
                         # --- Softmax Batch 处理 ---
@@ -607,51 +476,39 @@ def high_perf_mtgr_sparse_attn_kernel(
                             cur = i % 2
                             prv = 1 - cur
 
-                            scan_count = 0
-                            kv_start = 0
-                            kv_end_found = 0
-                            target = k_outer * num_stages + i
-                            k_scan_counter = 0
-                            for _seg in T.serial(max_segs):
-                                _seg_start = segment_offsets[b_i, _seg]
-                                _seg_len = segment_offsets[b_i, _seg + 1] - segment_offsets[b_i, _seg]
-                                _seg_len = T.if_then_else(_seg_len > 0, _seg_len, 0)
-                                _num_sp = T.ceildiv(_seg_len, block_M)
-                                for _lk in T.serial(_num_sp):
-                                    _kv_s = _seg_start + _lk * block_M
-                                    _kv_e = _seg_start + T.if_then_else((_lk + 1) * block_M < _seg_len, (_lk + 1) * block_M, _seg_len)
-                                    _in_range = k_scan_counter < kv_iter_end
-                                    _cond = (
-                                        ((rule == 0) & (_kv_s <= max_row_pos))
-                                        | ((rule == 1) & (_kv_s < seg_end))
-                                        | ((rule == 2) & ((_kv_s < seg_start) | ((_kv_s < q_end) & (_kv_e > q_start))))
-                                    )
-                                    _is_target = _in_range & _cond & (scan_count == target)
-                                    kv_start = T.if_then_else(_is_target, _kv_s, kv_start)
-                                    kv_end_found = T.if_then_else(_is_target, _kv_e, kv_end_found)
-                                    scan_count = T.if_then_else(_in_range & _cond, scan_count + 1, scan_count)
-                                    k_scan_counter = k_scan_counter + 1
-                            kv_size = kv_end_found - kv_start
+                            compact_k_idx = k_outer * num_stages + i
+                            k_idx = T.if_then_else(
+                                (q_start >= last_seg_start) & (compact_k_idx >= gap_k_start) & (gap_size > 0),
+                                compact_k_idx + gap_size,
+                                compact_k_idx
+                            )
+                            kv_start = k_idx * block_M
+                            kv_size = T.if_then_else(kv_start + block_M < k_upper_bound, block_M, k_upper_bound - kv_start)
 
                             # 【核心优化】计算掩盖 (Hiding Computation)：在等 Cube 前利用算力资源提前生成 MASK
                             T.pipe_barrier("v")
                             T.tile.fill(buf_2d, NEG_INF)
                             for row in T.serial(half_M):
                                 row_abs_pos = q_start + vid * half_M + row
-                                if rule == 0:
+
+                                _row_rule = row_rule_buf[row]
+                                _row_seg_start = row_seg_start_buf[row]
+                                _row_seg_end = row_seg_end_buf[row]
+
+                                if _row_rule == 0:
                                     raw_len = row_abs_pos - kv_start + 1
                                     fill_len = T.if_then_else(raw_len < kv_size, raw_len, kv_size)
                                     fill_len = T.if_then_else(fill_len > 0, fill_len, 0)
                                     if fill_len > 0:
                                         T.tile.fill(buf_2d[row, 0:fill_len], 0.0)
-                                elif rule == 1:
-                                    raw_len = seg_end - kv_start
+                                elif _row_rule == 1:
+                                    raw_len = _row_seg_end - kv_start
                                     fill_len = T.if_then_else(raw_len < kv_size, raw_len, kv_size)
                                     fill_len = T.if_then_else(fill_len > 0, fill_len, 0)
                                     if fill_len > 0:
                                         T.tile.fill(buf_2d[row, 0:fill_len], 0.0)
-                                elif rule == 2:
-                                    raw_len = seg_start - kv_start
+                                elif _row_rule == 2:
+                                    raw_len = _row_seg_start - kv_start
                                     fill_len = T.if_then_else(raw_len < kv_size, raw_len, kv_size)
                                     fill_len = T.if_then_else(fill_len > 0, fill_len, 0)
                                     if fill_len > 0:
@@ -856,6 +713,8 @@ def high_perf_sparse_attn_wrapper(
 
 
 def test(config, block_M=128, core_num=24, num_stages=14, cross_interval=2):
+    tilelang.disable_cache()
+    tilelang.cache.clear_cache()
     data = prepare_data(config)
     block_N = config.get("block_N", 128)
 
