@@ -163,7 +163,8 @@ def high_perf_mtgr_sparse_attn_kernel(
             scan_k_idx = T.alloc_var("int32", init=-1)
             s_local = T.alloc_var("int32", init=0)
             cum_sp = T.alloc_var("int32", init=0)
-            sp_val = T.alloc_var("int32", init=0)
+            sp_val_start = T.alloc_var("int32", init=0)
+            sp_val_end = T.alloc_var("int32", init=0)
             kv_start = T.alloc_var("int32", init=0)
             kv_end_found = T.alloc_var("int32", init=0)
             tiles_this_batch = T.alloc_var("int32", init=0)
@@ -176,7 +177,6 @@ def high_perf_mtgr_sparse_attn_kernel(
             for _b in T.serial(batch):
                 for _seg in T.serial(max_segs):
                     _seg_len = segment_offsets[_b, _seg + 1] - segment_offsets[_b, _seg]
-                    _seg_len = T.if_then_else(_seg_len > 0, _seg_len, 0)
                     total_seq_tiles = total_seq_tiles + T.ceildiv(_seg_len, block_M)
             total_tasks = total_seq_tiles * heads
             my_iters = T.if_then_else(
@@ -212,7 +212,6 @@ def high_perf_mtgr_sparse_attn_kernel(
                         num_tiles_b = 0
                         for _seg in T.serial(max_segs):
                             _seg_len = segment_offsets[_b, _seg + 1] - segment_offsets[_b, _seg]
-                            _seg_len = T.if_then_else(_seg_len > 0, _seg_len, 0)
                             num_tiles_b = num_tiles_b + T.ceildiv(_seg_len, block_M)
                         _is_this = (tile_id >= cum_tiles) & (tile_id < cum_tiles + num_tiles_b)
                         b_i = T.if_then_else(_is_this, _b, b_i)
@@ -220,33 +219,27 @@ def high_perf_mtgr_sparse_attn_kernel(
                         tiles_this_batch = T.if_then_else(_is_this, num_tiles_b, tiles_this_batch)
                         cum_tiles = cum_tiles + num_tiles_b
                     
-                    sp_val = 0
+                    sp_val_start = 0
+                    sp_val_end = 0
                     cum_sp = 0
                     for _seg in T.serial(max_segs):
                         _seg_start = segment_offsets[b_i, _seg]
                         _seg_len = segment_offsets[b_i, _seg + 1] - segment_offsets[b_i, _seg]
-                        _seg_len = T.if_then_else(_seg_len > 0, _seg_len, 0)
                         _num_sp = T.ceildiv(_seg_len, block_M)
-                        _lk = s_local - cum_sp
-                        _in_seg = (_lk >= 1) & (_lk <= _num_sp)
-                        _off = T.if_then_else(_lk * block_M < _seg_len, _lk * block_M, _seg_len)
-                        sp_val = T.if_then_else(_in_seg, _seg_start + _off, sp_val)
+                        # q_start
+                        _lk_s = s_local - cum_sp
+                        _in_seg_s = (_lk_s >= 1) & (_lk_s <= _num_sp)
+                        _off_s = T.if_then_else(_lk_s * block_M < _seg_len, _lk_s * block_M, _seg_len)
+                        sp_val_start = T.if_then_else(_in_seg_s, _seg_start + _off_s, sp_val_start)
+                        # q_end
+                        _lk_e = (s_local + 1) - cum_sp
+                        _in_seg_e = (_lk_e >= 1) & (_lk_e <= _num_sp)
+                        _off_e = T.if_then_else(_lk_e * block_M < _seg_len, _lk_e * block_M, _seg_len)
+                        sp_val_end = T.if_then_else(_in_seg_e, _seg_start + _off_e, sp_val_end)
+                        
                         cum_sp = cum_sp + _num_sp
-                    q_start = sp_val
-
-                    sp_val = 0
-                    cum_sp = 0
-                    for _seg in T.serial(max_segs):
-                        _seg_start = segment_offsets[b_i, _seg]
-                        _seg_len = segment_offsets[b_i, _seg + 1] - segment_offsets[b_i, _seg]
-                        _seg_len = T.if_then_else(_seg_len > 0, _seg_len, 0)
-                        _num_sp = T.ceildiv(_seg_len, block_M)
-                        _lk = (s_local + 1) - cum_sp
-                        _in_seg = (_lk >= 1) & (_lk <= _num_sp)
-                        _off = T.if_then_else(_lk * block_M < _seg_len, _lk * block_M, _seg_len)
-                        sp_val = T.if_then_else(_in_seg, _seg_start + _off, sp_val)
-                        cum_sp = cum_sp + _num_sp
-                    q_end = sp_val
+                    q_start = sp_val_start
+                    q_end = sp_val_end
                     q_tile_size = q_end - q_start
 
                     seg_id = 0
@@ -266,7 +259,6 @@ def high_perf_mtgr_sparse_attn_kernel(
                     for _seg in T.serial(max_segs):
                         _seg_start = segment_offsets[b_i, _seg]
                         _seg_len = segment_offsets[b_i, _seg + 1] - segment_offsets[b_i, _seg]
-                        _seg_len = T.if_then_else(_seg_len > 0, _seg_len, 0)
                         _num_sp = T.ceildiv(_seg_len, block_M)
                         for _lk in T.serial(_num_sp):
                             _tile_start = _seg_start + _lk * block_M
@@ -518,33 +510,28 @@ def high_perf_mtgr_sparse_attn_kernel(
                         tiles_this_batch = T.if_then_else(_is_this, num_tiles_b, tiles_this_batch)
                         cum_tiles = cum_tiles + num_tiles_b
 
-                    sp_val = 0
+                    sp_val_start = 0
+                    sp_val_end = 0
                     cum_sp = 0
                     for _seg in T.serial(max_segs):
                         _seg_start = segment_offsets[b_i, _seg]
                         _seg_len = segment_offsets[b_i, _seg + 1] - segment_offsets[b_i, _seg]
                         _seg_len = T.if_then_else(_seg_len > 0, _seg_len, 0)
                         _num_sp = T.ceildiv(_seg_len, block_M)
-                        _lk = s_local - cum_sp
-                        _in_seg = (_lk >= 1) & (_lk <= _num_sp)
-                        _off = T.if_then_else(_lk * block_M < _seg_len, _lk * block_M, _seg_len)
-                        sp_val = T.if_then_else(_in_seg, _seg_start + _off, sp_val)
-                        cum_sp = cum_sp + _num_sp
-                    q_start = sp_val
 
-                    sp_val = 0
-                    cum_sp = 0
-                    for _seg in T.serial(max_segs):
-                        _seg_start = segment_offsets[b_i, _seg]
-                        _seg_len = segment_offsets[b_i, _seg + 1] - segment_offsets[b_i, _seg]
-                        _seg_len = T.if_then_else(_seg_len > 0, _seg_len, 0)
-                        _num_sp = T.ceildiv(_seg_len, block_M)
-                        _lk = (s_local + 1) - cum_sp
-                        _in_seg = (_lk >= 1) & (_lk <= _num_sp)
-                        _off = T.if_then_else(_lk * block_M < _seg_len, _lk * block_M, _seg_len)
-                        sp_val = T.if_then_else(_in_seg, _seg_start + _off, sp_val)
+                        _lk_s = s_local - cum_sp
+                        _in_seg_s = (_lk_s >= 1) & (_lk_s <= _num_sp)
+                        _off_s = T.if_then_else(_lk_s * block_M < _seg_len, _lk_s * block_M, _seg_len)
+                        sp_val_start = T.if_then_else(_in_seg_s, _seg_start + _off_s, sp_val_start)
+                        
+                        _lk_e = (s_local + 1) - cum_sp
+                        _in_seg_e = (_lk_e >= 1) & (_lk_e <= _num_sp)
+                        _off_e = T.if_then_else(_lk_e * block_M < _seg_len, _lk_e * block_M, _seg_len)
+                        sp_val_end = T.if_then_else(_in_seg_e, _seg_start + _off_e, sp_val_end)
+                        
                         cum_sp = cum_sp + _num_sp
-                    q_end = sp_val
+                    q_start = sp_val_start
+                    q_end = sp_val_end
                     q_tile_size = q_end - q_start
 
                     seg_id = 0
