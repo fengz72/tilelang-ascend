@@ -1,5 +1,6 @@
-# msprof op --kernel-name="main_kernel" --output="./log" python examples/sparse-fa/sparse_fa_v5.py
-# msprof op simulator --soc-version=Ascend910B2 --kernel-name="main_kernel" --output="./log" python examples/sparse-fa/sparse_fa_v5.py
+# msprof op --kernel-name="main_kernel" --output="./log" python sparse_fa_scalar.py
+# msprof op simulator --soc-version=Ascend910B2 --kernel-name="main_kernel" --output="./log" python sparse_fa_scalar.py
+# msprof op simulator --soc-version=Ascend910B2 --kernel-name="main_kernel" --core-id=0 --launch-count=1 --output="./log" python sparse_fa_scalar.py
 
 import torch
 import tilelang
@@ -458,6 +459,7 @@ def high_perf_mtgr_sparse_attn_kernel(
                         row_seg_start_buf[row] = segment_offsets[b_i, seg_id]
                         row_seg_end_buf[row] = segment_offsets[b_i, seg_id + 1]
 
+                    T.pipe_barrier("v")
                     T.tile.fill(acc_o, 0.0)
                     T.tile.fill(sumexp, 0.0)
                     T.tile.fill(neg_sm, 2**30)
@@ -483,38 +485,53 @@ def high_perf_mtgr_sparse_attn_kernel(
                             kv_size = T.if_then_else(kv_start + block_M < k_upper_bound, block_M, k_upper_bound - kv_start)
 
                             # 【核心优化】计算掩盖 (Hiding Computation)：在等 Cube 前利用算力资源提前生成 MASK
-                            T.tile.fill(buf_2d, NEG_INF)
-                            for row in T.serial(half_M):
-                                row_abs_pos = q_start + vid * half_M + row
+                            _vid_first_rule = row_rule_buf[0]
+                            _vid_first_seg_start = row_seg_start_buf[0]
+                            _vid_first_seg_end = row_seg_end_buf[0]
+                            _first_row_pos = q_start + vid * half_M
+                            
+                            _is_full_kv = kv_size == block_M
 
-                                _row_rule = row_rule_buf[row]
-                                _row_seg_start = row_seg_start_buf[row]
-                                _row_seg_end = row_seg_end_buf[row]
+                            # 基于“可见性单调递增”原理：首行完全可见，则全块必然完全可见
+                            _r0_valid = (_vid_first_rule == 0) & (_first_row_pos + 1 >= kv_start + kv_size)
+                            _r1_valid = (_vid_first_rule == 1) & (kv_start + kv_size <= _vid_first_seg_end)
+                            _r2_valid = (_vid_first_rule == 2) & (kv_start + kv_size <= _vid_first_seg_start)
 
-                                if _row_rule == 0:
-                                    raw_len = row_abs_pos - kv_start + 1
-                                    fill_len = T.if_then_else(raw_len < kv_size, raw_len, kv_size)
-                                    fill_len = T.if_then_else(fill_len > 0, fill_len, 0)
-                                    if fill_len > 0:
-                                        T.tile.fill(buf_2d[row, 0:fill_len], 0.0)
-                                elif _row_rule == 1:
-                                    raw_len = _row_seg_end - kv_start
-                                    fill_len = T.if_then_else(raw_len < kv_size, raw_len, kv_size)
-                                    fill_len = T.if_then_else(fill_len > 0, fill_len, 0)
-                                    if fill_len > 0:
-                                        T.tile.fill(buf_2d[row, 0:fill_len], 0.0)
-                                elif _row_rule == 2:
-                                    raw_len = _row_seg_start - kv_start
-                                    fill_len = T.if_then_else(raw_len < kv_size, raw_len, kv_size)
-                                    fill_len = T.if_then_else(fill_len > 0, fill_len, 0)
-                                    if fill_len > 0:
-                                        T.tile.fill(buf_2d[row, 0:fill_len], 0.0)
-                                    diag_col = row_abs_pos - kv_start
-                                    
-                                    if (diag_col >= 0) & (diag_col < kv_size):
-                                        T.set_flag("v", "s", SIG_V_S_READY)
-                                        T.wait_flag("v", "s", SIG_V_S_READY)
-                                        buf_2d[row, diag_col] = 0.0
+                            _all_valid = T.if_then_else(_is_full_kv & _r0_valid, 1,
+                                         T.if_then_else(_is_full_kv & _r1_valid, 1,
+                                         T.if_then_else(_is_full_kv & _r2_valid, 1, 0)))
+                            if _all_valid == 1:
+                                T.tile.fill(buf_2d, 0.0)
+                            else:
+                                T.tile.fill(buf_2d, NEG_INF)
+                                T.pipe_barrier("v")
+                                for row in T.serial(half_M):
+                                    row_abs_pos = q_start + vid * half_M + row
+
+                                    _row_rule = row_rule_buf[row]
+                                    _row_seg_start = row_seg_start_buf[row]
+                                    _row_seg_end = row_seg_end_buf[row]
+
+                                    if _row_rule == 0:
+                                        raw_len = row_abs_pos - kv_start + 1
+                                        fill_len = T.if_then_else(raw_len < kv_size, raw_len, kv_size)
+                                        if fill_len > 0:
+                                            T.tile.fill(buf_2d[row, 0:fill_len], 0.0)
+                                    elif _row_rule == 1:
+                                        raw_len = _row_seg_end - kv_start
+                                        fill_len = T.if_then_else(raw_len < kv_size, raw_len, kv_size)
+                                        if fill_len > 0:
+                                            T.tile.fill(buf_2d[row, 0:fill_len], 0.0)
+                                    elif _row_rule == 2:
+                                        raw_len = _row_seg_start - kv_start
+                                        fill_len = T.if_then_else(raw_len < kv_size, raw_len, kv_size)
+                                        if fill_len > 0:
+                                            T.tile.fill(buf_2d[row, 0:fill_len], 0.0)
+                                        diag_col = row_abs_pos - kv_start
+                                        if (diag_col >= 0) & (diag_col < kv_size):
+                                            T.set_flag("v", "s", SIG_V_S_READY)
+                                            T.wait_flag("v", "s", SIG_V_S_READY)
+                                            buf_2d[row, diag_col] = 0.0
 
                             T.wait_flag("V", "MTE2", SIG_IO_UB)
                             if i % cross_interval == 0:
@@ -759,8 +776,8 @@ if __name__ == "__main__":
         {
             "H": 8,
             "D": 128,
-            "seg_lengths": [[1600, 8] + [5] * 2 + [1200]],
-            "rules": [0, 1] +  [2] * 2 + [2],
+            "seg_lengths": [[1600, 8, 5, 5, 1200]],
+            "rules": [0, 1, 2, 2, 2],
             "matched_prefix_arr": [0],
         },
     ]

@@ -116,6 +116,7 @@ def prepare_data(config):
         block_size=block_size,
     )
 
+case = []
 
 _base_patterns = [
     {
@@ -357,13 +358,45 @@ def _generate_constraint_patterns():
     return patterns
 
 
-_base_patterns.extend(_generate_multi_seg_patterns())
-_base_patterns.extend(_generate_constraint_patterns())
+def _generate_multi_seg():
+    patterns = []
 
-_D_values = [128, 64, 32]
+    cases = [
+        (1,   5,  1),
+        (2,   5,  1),
+        (4,   5,  1),
+        (8,   5,  1),
+        (16,   5,  1),
+        (32,   5,  1),
+        (64,   5,  1),
+        (128,  5,  1),
+        (256,  5,  1),
+        (512,  5,  1),
+        (1024, 5,  1),
+    ]
+
+    for num_seg, seg_len, B in cases:
+        sl = [1600, 8] + [seg_len] * num_seg + [1200]
+        seg_lengths = [sl] * B
+        rules = [0, 1] + [2] * num_seg + [2]
+        patterns.append({
+            "seg_lengths": seg_lengths,
+            "rules": rules,
+            "matched_prefix_arr": [0] * B,
+        })
+
+    return patterns
+
+case.extend(_base_patterns)
+case.extend(_generate_multi_seg())
+# case.extend(_generate_multi_seg_patterns())
+# case.extend(_generate_constraint_patterns())
+
+# _D_values = [128, 64, 32]
+_D_values = [128]
 
 test_configs = [
     {"H": 8, "D": d, **pattern}
     for d in _D_values
-    for pattern in _base_patterns
+    for pattern in case
 ]
