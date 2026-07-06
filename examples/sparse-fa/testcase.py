@@ -365,11 +365,19 @@ def _generate_multi_seg():
         (1,   5,  1),
         (2,   5,  1),
         (4,   5,  1),
+        (7,   5,  1),
         (8,   5,  1),
+        (15,   5,  1),
         (16,   5,  1),
+        (25,   5,  1),
         (32,   5,  1),
+        (43,   5,  1),
+        (63,   5,  1),
         (64,   5,  1),
+        (85,   5,  1),
+        (119,  5,  1),
         (128,  5,  1),
+        (143,  5,  1),
         (256,  5,  1),
         (512,  5,  1),
         (1024, 5,  1),
@@ -387,7 +395,7 @@ def _generate_multi_seg():
 
     return patterns
 
-case.extend(_base_patterns)
+# case.extend(_base_patterns)
 case.extend(_generate_multi_seg())
 # case.extend(_generate_multi_seg_patterns())
 # case.extend(_generate_constraint_patterns())

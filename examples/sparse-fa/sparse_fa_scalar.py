@@ -1,6 +1,6 @@
 # msprof op --kernel-name="main_kernel" --output="./log" python sparse_fa_scalar.py
 # msprof op simulator --soc-version=Ascend910B2 --kernel-name="main_kernel" --output="./log" python sparse_fa_scalar.py
-# msprof op simulator --soc-version=Ascend910B2 --kernel-name="main_kernel" --core-id=0 --launch-count=1 --output="./log" python sparse_fa_scalar.py
+# msprof op simulator --soc-version=Ascend910B2 --kernel-name="main_kernel" --core-id=0 --timeout=60 --output="./log" python sparse_fa_scalar.py
 
 import torch
 import tilelang
@@ -776,8 +776,8 @@ if __name__ == "__main__":
         {
             "H": 8,
             "D": 128,
-            "seg_lengths": [[1600, 8, 5, 5, 1200]],
-            "rules": [0, 1, 2, 2, 2],
+            "seg_lengths": [[1600, 8] + [5] * 1 + [1200]],
+            "rules": [0, 1] + [2] * 1 +  [2],
             "matched_prefix_arr": [0],
         },
     ]
