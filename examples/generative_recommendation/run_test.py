@@ -188,7 +188,7 @@ def run_kernel(data, config):
         data["value_snd"].npu(),
         data["segment_offsets_i32"].npu(),
         data["segment_rules_i32"].npu(),
-        data["q_seq_starts_i32"],
+        data["q_seq_starts_i32"].npu(),
         data["matched_prefix_lens_i32"].npu(),
         match_mode,
         data["key_cache"].npu(),
