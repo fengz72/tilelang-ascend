@@ -112,6 +112,8 @@ private:
 
   void SelectCodegen(const CallNode *op, const std::string &op_name);
 
+  void IfThenElseCodegen(const CallNode *op, std::ostream &os);
+
   void MulAddDstCodegen(const CallNode *op);
 
   void InitSortBufCodegen(const CallNode *op);

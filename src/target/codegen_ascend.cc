@@ -735,6 +735,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     CreateDatacacheExperimentCodegen(op);
   } else if (op->op.same_as(tl::ascend_brcb_experiment())) {
     BrcbExperimentCodegen(op);
+  } else if (op->op.same_as(builtin::if_then_else())) {
+    IfThenElseCodegen(op, os);
   } else {
     // tvm::Dump(op);
     CodeGenC::VisitExpr_(op, os);
@@ -1448,6 +1450,40 @@ void CodeGenTileLangAscend::UnaryVecOpCodegen(const CallNode *op,
                                               const std::string &op_name) {
   int len = op->args.size();
   PrintOpCall(op, op_name, {0, len - 1}, {len - 1, len});
+}
+
+void CodeGenTileLangAscend::IfThenElseCodegen(const CallNode *op,
+                                              std::ostream &os) {
+  std::string result = name_supply_->FreshName("condval");
+  std::string cond = PrintExpr(op->args[0]);
+  this->PrintIndent();
+  PrintType(op->dtype, this->stream);
+  this->stream << " " << result << ";\n";
+  this->PrintIndent();
+  if (cond[0] == '(' && cond[cond.length() - 1] == ')') {
+    this->stream << "if " << cond << " {\n";
+  } else {
+    this->stream << "if (" << cond << ") {\n";
+  }
+  {
+    int then_scope = this->BeginScope();
+    std::string true_val = PrintExpr(op->args[1]);
+    this->PrintIndent();
+    this->stream << result << " = " << true_val << ";\n";
+    this->EndScope(then_scope);
+    this->PrintIndent();
+    this->stream << "} else {\n";
+  }
+  {
+    int else_scope = this->BeginScope();
+    std::string false_val = PrintExpr(op->args[2]);
+    this->PrintIndent();
+    this->stream << result << " = " << false_val << ";\n";
+    this->EndScope(else_scope);
+    this->PrintIndent();
+    this->stream << "}\n";
+  }
+  os << result;
 }
 
 void CodeGenTileLangAscend::SelectCodegen(const CallNode *op,

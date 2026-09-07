@@ -1102,7 +1102,11 @@ void CodeGenTileLangAscendPto::VisitExpr_(const CallNode *op,
     PrintType(op->dtype, this->stream);
     this->stream << " " << result << ";\n";
     this->PrintIndent();
-    this->stream << "if (" << cond << ") {\n";
+    if (cond[0] == '(' && cond[cond.length() - 1] == ')') {
+      this->stream << "if " << cond << " {\n";
+    } else {
+      this->stream << "if (" << cond << ") {\n";
+    }
     {
       int then_scope = this->BeginScope();
       std::string true_val = PrintExpr(op->args[1]);
